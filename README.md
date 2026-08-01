@@ -23,7 +23,7 @@ disappearing from `help`.
 ## Injecting
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/<user>/<repo>/main/cs_portable.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/xReset/cs-dist/main/cs_portable.lua"))()
 ```
 
 Needs an executor with `HttpGet` and `loadstring`. Config persistence

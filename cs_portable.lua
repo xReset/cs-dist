@@ -18107,7 +18107,14 @@ local function hotReadSource()
     -- throw here kills the polling task -- which would disable reload for the
     -- session on the first blip, exactly the silent failure this is meant to end.
     if HOT_URL then
-        local ok, body = pcall(function() return game:HttpGet(HOT_URL) end)
+        -- Cache-bust every poll. Roblox HttpGet and several executors cache
+        -- responses by URL, and raw.githubusercontent has its own ~5min edge
+        -- cache -- so a plain re-fetch can return the OLD published copy forever
+        -- and hot reload silently never advances. A unique query param defeats
+        -- both caches; raw serves the file regardless of unknown query params.
+        local url = HOT_URL .. (HOT_URL:find("?", 1, true) and "&" or "?")
+            .. "cb=" .. tostring(os.time())
+        local ok, body = pcall(function() return game:HttpGet(url) end)
         if ok and type(body) == "string" and #body > 0 then return body end
         return nil, "cannot fetch " .. HOT_URL .. " — " .. tostring(body)
     end

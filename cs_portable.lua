@@ -352,10 +352,9 @@ if S.armAll == nil then S.armAll = true end
 S.coneVis = S.coneVis or false
 -- HUD visibility (RightShift). Persisted; see CFG_SPEC.hudVisible.
 S.hudVisible = (S.hudVisible ~= false)
--- COWBOY High Noon on the game's F key. Persisted; see CFG_SPEC.highNoon.
--- Defaults OFF: it SPAWNS projectiles, so it is the last switch that should
--- ever come up hot on inject.
-S.highNoon = S.highNoon or false
+-- No S.highNoon. High Noon is armed by its CLASS (`hs COWBOY`), not by a
+-- setting of its own -- see the highNoon block in cs_classes.lua for why the
+-- separate switch was removed. Nothing to persist, nothing to restore.
 
 local CFG_FILE = "cs_admin_config.txt"
 
@@ -433,12 +432,10 @@ local CFG_SPEC = {
     -- back is the same unreachable-UI failure as a panel dragged off-screen.
     hudVisible = "boolean",
 
-    -- COWBOY High Noon: fire an aimed hitscan round with Burn on the F key.
-    --
-    -- Persisted like the other combat switches, and like them it ACTS -- but
-    -- this one spawns a body rather than changing a stat, so it defaults OFF and
-    -- is class-gated in two places. `highnoon` fires one manually.
-    highNoon = "boolean",
+    -- No highNoon key. It was one, and a stale `highNoon = true` may still be
+    -- sitting in an existing cs_admin_config.txt -- loadConfig ignores keys that
+    -- are not in this table, so the leftover is inert and gets dropped on the
+    -- next save. Do not re-add it: arming lives with the class now.
 
     -- ==================================================================
     -- COMBAT TOGGLES — persisted on instruction 2026-07-31.
@@ -1081,6 +1078,13 @@ local T = {
     -- not remove the guard.
     legitMaxTotalDeviationDeg = 55,
 
+    -- See RETURN_ARM_DIST. Distance from the owner at which a returning body
+    -- starts handing steering back; authority reaches zero at RETURN_TRIP_DIST
+    -- (8 studs), where the flight ends anyway. 20 gives roughly a third of a
+    -- second of fade on a speed-70 JESTER ball -- long enough that the handover
+    -- is not a step, short enough that it is not giving up the return leg.
+    legitReturnFadeStuds = 20,
+
     -- (4) Stop steering inside this distance of the target. Terminal-phase
     -- corrections are what read as magnetic; by this range the shot has already
     -- either worked or not.
@@ -1175,6 +1179,12 @@ local CLOSE_LOCK_STUDS = 16
 
 local RETURN_ARM_DIST = 25
 local RETURN_TRIP_DIST = 8
+-- Outer edge of the return fade band. A tunable rather than a constant for two
+-- reasons: cs_core.lua is at the 200 top-level-local ceiling so a new `local`
+-- here would refuse the whole engine, and this is a look-and-feel number that
+-- wants `hstune legitReturnFadeStuds N` mid-match rather than a rebuild.
+-- Between this and RETURN_TRIP_DIST our steering authority fades to zero, so
+-- the game's return script inherits a coasting body instead of a turning one.
 
 -- Mid-flight LOS does not arm until the body has travelled this far from where
 -- it spawned. See the arm-on-travel note in the steer loop.
@@ -1493,6 +1503,36 @@ function Core.friendsList()
     return out
 end
 
+-- PROTECTED IDENTITIES — hardcoded, not configurable, not a whitelist.
+--
+-- Every copy of this engine refuses to LOCK these names. It exists because the
+-- portable build is handed to other people: when the holder assists a third
+-- player, the echo bolts forged for that assist are owned by the holder's
+-- client and steer at whatever the cone finds -- which in FFA legitimately
+-- includes the person who gave them the script.
+--
+-- Deliberately NOT the friends whitelist, and not reachable from any command or
+-- panel row. A toggle is something the holder can turn off, forget, or fail to
+-- restore from a config file they do not have; the whole value here is that it
+-- cannot be any of those. On Core rather than a chunk-level `local` because
+-- cs_core.lua is at Luau's 200 top-level-local ceiling.
+--
+-- Player.Name only. Display names are not unique and are not what the engine
+-- enumerates, so matching one would be both spoofable and wrong.
+--
+-- SCOPE, honestly: this stops GUIDANCE. It does not make anyone invincible.
+-- The holder's ordinary attacks are created and resolved by the game's own
+-- handler (0463.lua:12) and never pass through here -- a shot aimed at you by
+-- hand still lands. What it removes is bolts CURVING into you.
+Core.protectedNames = {
+    keeley7823 = true,
+}
+
+function Core.isProtected(c)
+    local p = c and Players:GetPlayerFromCharacter(c)
+    return p ~= nil and Core.protectedNames[string.lower(p.Name)] == true
+end
+
 -- friendBlocked() was deleted here, not disabled: rejectReason was its only
 -- caller, and "no exceptions" removed that call. A predicate nothing asks is
 -- dead code that still loads (CS_CONSTRAINTS 5b).
@@ -1514,8 +1554,19 @@ function Core.rejectReason(c, myChar, ctx)
         if ctx.exclude and ctx.exclude[c] then return "excluded" end
         if ctx.shooter and c == ctx.shooter then return "shooter" end
     end
-    -- NO SOFT EXCLUSIONS. Instructed 2026-07-31: "Heatseek should work against
-    -- friends and allies and everything. No exceptions."
+    -- ONE hard exclusion, and it is not a soft one. See Core.protectedNames:
+    -- a fixed identity that no build may lock, so that handing the portable to
+    -- somebody does not hand them a homing weapon aimed at you. It reports its
+    -- own reason, so unlike the whitelist it can never refuse a target silently
+    -- -- `reject: protected` in the histogram names it every time.
+    if Core.isProtected(c) then return "protected" end
+
+    -- NO OTHER SOFT EXCLUSIONS. Instructed 2026-07-31: "Heatseek should work
+    -- against friends and allies and everything. No exceptions." That still
+    -- stands for everyone who is not in the list above -- the two are different
+    -- things: this is a build-time constant, those were user-facing lists that
+    -- made whole players permanently unhittable by accident, across sessions,
+    -- silently, because ally and friend names persisted.
     --
     -- The `friend` and `ally` rejects that sat here are DELETED, not disabled
     -- (CS_CONSTRAINTS 5b). Both were OUR policy, not the game's:
@@ -1658,8 +1709,21 @@ function Core.enumerateCandidates()
         candCache[#candCache + 1] = model
     end
 
+    -- A player with no Character is INVISIBLE to every diagnostic we have:
+    -- consider() drops nil before rejectReason runs, so they are absent from the
+    -- candidate list, absent from the reject histogram, and absent from the
+    -- no-lock line. "The engine never even considered them" and "the engine
+    -- refused them" look identical from the log, and they have opposite fixes.
+    -- Counted here so the no-lock line can say which one happened.
+    S.noCharPlayers = 0
     for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= lp then consider(p.Character) end
+        if p ~= lp then
+            if p.Character then
+                consider(p.Character)
+            else
+                S.noCharPlayers = S.noCharPlayers + 1
+            end
+        end
     end
 
     if now - npcBuiltAt > NPC_STALE_SEC then rebuildNpcCache() end
@@ -1983,7 +2047,28 @@ local function reachFor(cfg, proj, declared)
     local r = declared or 0
     local seen = proj and observedReach[
         string.lower(tostring(cfg and cfg.name or "?") .. "/" .. proj.Name)]
-    if seen and seen > r then return seen end
+    if seen and seen > r then r = seen end
+
+    -- PER-BODY REACH SCALE, applied last so it scales the reach actually in
+    -- force -- declared Range or learned observedReach, whichever won above.
+    -- Scaling `declared` instead would be silently undone the moment the body
+    -- flew further than its Range, which is the normal case (HANDOFF night §1).
+    --
+    -- This shortens what the LOCK will reach for. It does not shorten the bolt,
+    -- which flies exactly as far as it always did -- the effect is that distant
+    -- targets are no longer locked at all, and a shot that would have curved
+    -- across the map to reach one now flies straight past as an honest miss.
+    --
+    -- Config shape (engine/cs_classes.lua):
+    --     lockReachScale = 0.85                        -- whole class
+    --     lockReachScale = { attack = 0.85, ability1 = 0.5 }   -- per body
+    local sc = cfg and cfg.lockReachScale
+    if type(sc) == "table" and proj then
+        local v = sc[string.lower(proj.Name)]
+        if type(v) ~= "number" then v = sc.default end
+        sc = v
+    end
+    if type(sc) == "number" and sc > 0 then r = r * sc end
     return r
 end
 
@@ -2040,8 +2125,20 @@ local function scanCone(fromPos, look, cap, fov, myChar, ctx, countRejects, clos
         local why = Core.rejectReason(c, myChar, ctx)
         if why then
             if countRejects then Core.noteReject(why) end
+            -- PLAYERS, SEPARATELY. The reject histogram is global and anonymous,
+            -- so "everybody is Safe because the round ended" and "the map props
+            -- are not damageable" land in the same bucket and the no-lock line
+            -- reports the props. A no-lock is only ever interesting because a
+            -- PERSON was not lockable, so count people on their own.
+            if st and Players:GetPlayerFromCharacter(c) then
+                st.playerWhy = st.playerWhy or {}
+                st.playerWhy[why] = (st.playerWhy[why] or 0) + 1
+            end
         else
             valid = valid + 1
+            if st and Players:GetPlayerFromCharacter(c) then
+                st.validPlayers = (st.validPlayers or 0) + 1
+            end
             local ph = c:FindFirstChild("HumanoidRootPart")
             if ph then
                 local dir = ph.Position - fromPos
@@ -2162,13 +2259,110 @@ local function lockFovFor(cfg, proj)
     return nil
 end
 
+-- PER-BODY DEVIATION BUDGET -- the total heading change a body may spend.
+--
+-- Global by default (T.legitMaxTotalDeviationDeg). A per-body override exists
+-- because the budget, not the cone, is what actually refuses a close target at
+-- a steep angle -- and that is a shape some kits produce constantly.
+--
+-- JESTER's Q is the case. The ball carries the player INTO THE AIR, so the
+-- people worth hitting are below and in front: 40-55 degrees off the aim axis
+-- at 10-20 studs. pickTarget clamps every cone to `budget - margin`, and the
+-- margin scales as atan(lockDriftStudsPerSec / boltSpeed) -- which for a
+-- speed-70 ball is 6 + 12.9 = 18.9 degrees, leaving a 36 degree ceiling. A
+-- lockFov of 38 or 50 makes no difference at all; both get clamped to 36 and
+-- the target below you is refused. Raising the budget for that ONE body is the
+-- only lever that moves it.
+--
+-- The distance cancellation is why the cone cannot be fixed instead: drift is
+-- v*t and t is dist/speed, so the angular drift a target subtends is v/speed
+-- regardless of range. A close target does NOT get a cheaper margin.
+--
+-- Config shape (engine/cs_classes.lua):
+--     lockDev = 70                      -- whole class
+--     lockDev = { ability1 = 75 }       -- per body, by name
+function Core.lockDevFor(cfg, proj)
+    local d = cfg and cfg.lockDev
+    if type(d) == "table" and proj then
+        local v = d[string.lower(proj.Name)]
+        if type(v) ~= "number" then v = d.default end
+        d = v
+    end
+    if type(d) == "number" and d > 0 then return d end
+    return T.legitMaxTotalDeviationDeg
+end
+
+-- How far a body must be from its owner before we steer it at all.
+--
+-- Was read straight off cfg.flight and therefore applied to EVERY body of the
+-- class. It exists for kits where one body name covers two phases -- JESTER's Q
+-- ball is summoned under the player, ridden, then kicked -- and applying it to
+-- the class also gagged that class's m1 for its first 12 studs.
+--
+-- Config shape (engine/cs_classes.lua):
+--     steerAfterOwnerStuds = 12                  -- whole class (back-compat)
+--     steerAfterOwnerStuds = { ability1 = 12 }   -- per body, by name
+--
+-- On Core rather than a chunk-level `local`: cs_core.lua is at Luau's 200
+-- top-level-local ceiling and the 201st makes Potassium refuse the engine.
+function Core.steerAfterOwnerStudsFor(cfg, proj)
+    local v = cfg and cfg.flight and cfg.flight.steerAfterOwnerStuds
+    if type(v) == "number" then return v end
+    if type(v) == "table" and proj then
+        local n = v[string.lower(proj.Name)]
+        if type(n) ~= "number" then n = v.default end
+        if type(n) == "number" then return n end
+    end
+    return nil
+end
+
+-- Per-body "the shot does not come out of ME" flag.
+--
+-- The self targeting path anchors the search cone at the PLAYER's root and the
+-- camera's look (aimOrigin), because for every class up to now the bolt spawns
+-- at the caster's muzzle and flies where the caster is facing. CONTROLLER breaks
+-- that: its ATK barrage is fired by a DRONE that hovers wherever the marker was
+-- placed, which is routinely tens of studs away and pointing somewhere else
+-- entirely. Anchoring at the player there is the same class of bug as the
+-- third-person camera offset and the ally-echo boomerang -- a distance and an
+-- angle measured from a point that is not the thing travelling. The symptom is
+-- `no target` on shots the drone was aimed straight at, plus locks the bolt then
+-- burns its whole deviation budget turning toward.
+--
+-- The fix is the mechanism the ally path already uses: hand pickTarget an origin
+-- taken from the BODY (ctx.originPos / ctx.originLook), which is also what the
+-- mid-flight relock does. This flag only says WHICH bodies need it.
+--
+-- Config shape (engine/cs_classes.lua):
+--     lockFromBody = true                    -- every body of the class
+--     lockFromBody = { "attack" }            -- these bodies only, by name
+--
+-- Deliberately NOT the default for everyone: a body welded to or spawned inside
+-- the caster has a meaningless LookVector for a frame or two, and the player-root
+-- origin is the more truthful one there.
+-- Hung off `Core` rather than declared as a top-level local: cs_core.lua sits
+-- at Luau's 200 top-level-local ceiling and one more chunk-level `local` makes
+-- Potassium refuse the whole script (tools/build_admin.sh checks this).
+function Core.lockFromBody(cfg, proj)
+    local lb = cfg and cfg.lockFromBody
+    if not lb or not proj then return false end
+    if lb == true then return true end
+    if type(lb) == "table" then
+        local n = string.lower(proj.Name)
+        for _, b in ipairs(lb) do
+            if n == string.lower(b) then return true end
+        end
+    end
+    return false
+end
+
 -- `fovCeiling` overrides the deviation-budget ceiling, and exists for ONE case:
 -- a shot that is aimed at spawn and never steered. The ceiling below is there to
 -- stop the engine committing to a target the STEERING budget cannot turn to --
 -- so for a round with zero steered frames it is measuring the wrong thing
 -- entirely. High Noon is that round (see fireHighNoon). Anything that actually
 -- steers must leave this nil and take the budget's answer.
-function Core.pickTarget(projRange, myChar, ctx, fovOverride, closeStuds, fovCeiling, boltSpeed)
+function Core.pickTarget(projRange, myChar, ctx, fovOverride, closeStuds, fovCeiling, boltSpeed, devBudget)
     local tPick = perfBegin()
     myChar = myChar or char()
     local fromPos, look = aimOrigin(ctx)
@@ -2238,7 +2432,12 @@ function Core.pickTarget(projRange, myChar, ctx, fovOverride, closeStuds, fovCei
         if boltSpeed and boltSpeed > 1 then
             margin = margin + math.deg(math.atan(T.lockDriftStudsPerSec / boltSpeed))
         end
-        devCeiling = T.legitMaxTotalDeviationDeg - margin
+        -- devBudget is the per-body override when the class declares one, and
+        -- T.legitMaxTotalDeviationDeg otherwise. The margin is subtracted from
+        -- whichever is in force, so the invariant "never lock what the budget
+        -- cannot steer to" holds unchanged -- it is simply measured against the
+        -- budget this body actually has.
+        devCeiling = (devBudget or T.legitMaxTotalDeviationDeg) - margin
     end
     local softFov = math.min(baseFov * T.softFovMult, devCeiling)
     local hardFov = math.min(baseFov, softFov)
@@ -2255,6 +2454,7 @@ function Core.pickTarget(projRange, myChar, ctx, fovOverride, closeStuds, fovCei
 
     if not best and T.softFovEnabled and softFov > hardFov then
         st.outRange, st.outCone, st.nearDist, st.nearAng, st.nearName = 0, 0, math.huge, 0, nil
+        st.playerWhy, st.validPlayers = nil, nil
         usedFov = softFov
         best, cost, ang, dist, noLos, valid, inCone, stickyCostNow, noLosCost,
             noLosAng, noLosDist =
@@ -2346,11 +2546,186 @@ function Core.pickTarget(projRange, myChar, ctx, fovOverride, closeStuds, fovCei
             who = (" [ECHO PRE-LOCK <- %s]"):format(
                 (ctx.allyPlayer and ctx.allyPlayer.Name) or ctx.allyName or "?")
         end
-        logx("lock", ("no lock — cap=%.0f fov=%.0f valid=%d cone=%d far=%d wide=%d nearest=%s%s%s")
-            :format(cap, usedFov, valid, inCone, st.outRange, st.outCone, near, tag, who))
+        -- THE PEOPLE LINE. `valid=11 ... nearest=NormalDummy2 @401 studs` is a
+        -- true sentence that answers the wrong question: it describes the lobby
+        -- props left in the candidate set after every human was refused, and it
+        -- reads as a RANGE problem, which is the one bucket the docs call
+        -- "positioning, nothing to tune". Final Strike on 2026-08-01 04:46 cost
+        -- an hour to exactly this: twelve consecutive UNGUIDED bolts while the
+        -- line pointed at a dummy 400 studs away.
+        --
+        -- So say it outright: how many PEOPLE were lockable, and if none, what
+        -- refused each one by name. `players=0 (safe x1)` is the whole answer in
+        -- six characters, and `players=0 (no character x1)` is the other one --
+        -- a player whose Character is nil never reaches rejectReason at all and
+        -- so cannot appear in any histogram.
+        local pw = ""
+        if st.playerWhy then
+            local parts = {}
+            for reason, n in pairs(st.playerWhy) do
+                parts[#parts + 1] = ("%s x%d"):format(reason, n)
+            end
+            table.sort(parts)
+            pw = " (" .. table.concat(parts, ", ") .. ")"
+        end
+        if S.noCharPlayers and S.noCharPlayers > 0 then
+            pw = pw .. (" (no character x%d)"):format(S.noCharPlayers)
+        end
+        logx("lock", ("no lock — cap=%.0f fov=%.0f valid=%d players=%d%s cone=%d far=%d wide=%d nearest=%s%s%s")
+            :format(cap, usedFov, valid, st.validPlayers or 0, pw,
+                inCone, st.outRange, st.outCone, near, tag, who))
+        -- ZERO PEOPLE LOCKABLE: name every one of them and why, unprompted.
+        -- This is the line that would have ended the 2026-08-01 Final Strike
+        -- hunt in one read instead of an hour of counter arithmetic. Self shots
+        -- only -- an ally echo pre-lock failing to find a target for SOMEBODY
+        -- ELSE's bolt is a different question and would double every line.
+        if (st.validPlayers or 0) == 0 and not (ctx and ctx.isEcho) then
+            Core.logPeopleSnapshot()
+        end
     end
     perfEnd("pickTarget", tPick)
     return best
+end
+
+-- AUTOMATIC PEOPLE SNAPSHOT. Fires itself when a scan finds NOBODY.
+--
+-- The `why` command below answers the same question better, but it has to be
+-- typed, and the moment worth diagnosing is a fight you are losing -- nobody
+-- opens a console mid-duel. This runs on the failure itself, so the answer is
+-- already in cs_core.log by the time anyone thinks to look.
+--
+-- Fires only when the scan produced zero lockable PEOPLE while people were in
+-- the server: exactly the "twelve UNGUIDED bolts in a row" case, never during
+-- ordinary play. Two guards keep it off the hot path:
+--
+--   * signature. One line per distinct set of reasons. A whole Final Strike
+--     prints once, not once per bolt of every volley.
+--   * floor. Even when the signature keeps changing (people moving in and out
+--     of range), never more than one line every PEOPLE_SNAP_SEC.
+--
+-- Cost is one rejectReason per player, and only on a frame that already failed
+-- to lock -- the same predicate the scan just ran, on a list that is at most
+-- server size.
+function Core.logPeopleSnapshot()
+    local now = os.clock()
+    if S.peopleSnapAt and (now - S.peopleSnapAt) < 1.0 then return end
+
+    local mc = char()
+    local rows, sig = {}, {}
+    local fromPos = nil
+    local root = mc and mc:FindFirstChild("HumanoidRootPart")
+    if root then fromPos = root.Position end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lp then
+            local c = p.Character
+            local why, dist
+            if not c then
+                -- The invisible case. Never appears in the reject histogram
+                -- because consider() drops it before rejectReason ever runs.
+                why = "NO CHARACTER (never enumerated)"
+            else
+                why = Core.rejectReason(c, mc, nil) or "LOCKABLE"
+                local ph = c:FindFirstChild("HumanoidRootPart")
+                if ph and fromPos then dist = (ph.Position - fromPos).Magnitude end
+            end
+            rows[#rows + 1] = dist
+                and ("%s=%s @%.0f"):format(p.Name, why, dist)
+                or  ("%s=%s"):format(p.Name, why)
+            sig[#sig + 1] = p.Name .. "=" .. why
+        end
+    end
+    if #rows == 0 then return end
+
+    table.sort(sig)
+    local signature = table.concat(sig, "|")
+    -- Same reasons as last time: already said, and saying it again per bolt is
+    -- how a diagnostic becomes noise nobody reads.
+    if signature == S.peopleSnapSig and (now - (S.peopleSnapAt or 0)) < 15 then
+        return
+    end
+    S.peopleSnapSig = signature
+    S.peopleSnapAt = now
+    table.sort(rows)
+    logwarn("lock", "NOBODY LOCKABLE — " .. table.concat(rows, ", "))
+end
+
+-- ONE PERSON, RIGHT NOW, IN FULL. The `why <player>` command.
+--
+-- Every targeting diagnostic in this engine is an AGGREGATE: the reject
+-- histogram is anonymous counters, the no-lock line names only the nearest valid
+-- candidate, and the FLIGHT line names no target at all. So the one question
+-- that actually gets asked in play -- "why did it not lock HIM" -- could only be
+-- answered by inference from counter deltas, and that inference was wrong four
+-- times in a row on 2026-08-01 (partner, then ARCHER's cone, then the round-end
+-- Safe flag) before this existed.
+--
+-- Reads the same predicates the scan does, in the same order, so it cannot drift
+-- from what targeting actually decides. Geometry is measured against the LAST
+-- bolt's cone and reach (S.lastBoltFov / S.lastBoltRange), which is what the
+-- next shot of the class in hand will use.
+function Core.explainTarget(p)
+    if not p then return "no such player" end
+    if p == lp then return p.Name .. ": that is you" end
+    local c = p.Character
+    if not c then
+        return p.Name .. ": NO CHARACTER — invisible to targeting. Not a "
+            .. "candidate, and not in any reject bucket either."
+    end
+
+    local mc = char()
+    local why = Core.rejectReason(c, mc, nil)
+    local out = ("%s: %s"):format(p.Name, why and ("REFUSED — " .. why) or "lockable")
+
+    -- The game's own oracle values, printed raw. `safe=1` next to `REFUSED —
+    -- safe` is the difference between believing the engine and checking it.
+    local stats = c:FindFirstChild("Stats")
+    local function sv(n)
+        local v = stats and stats:FindFirstChild(n)
+        return v and tostring(v.Value) or "-"
+    end
+    out = out .. ("\n  state: safe=%s hp=%s disable=%s pairID=%s")
+        :format(sv("Safe"), sv("CurrentHP"), sv("Disable"),
+            tostring(p:GetAttribute("PairID")))
+    local tags = {}
+    for _, n in ipairs({ "Challenge", "Alternate", "FinalStrike" }) do
+        if headTag(c, n) then tags[#tags + 1] = n end
+    end
+    if c:FindFirstChild("FinalStrike") then tags[#tags + 1] = "FinalStrike(char)" end
+    out = out .. ("  tags: %s"):format(#tags > 0 and table.concat(tags, ",") or "none")
+
+    -- In the candidate list at all? A model can be refused (a reason) or simply
+    -- never enumerated (no reason anywhere), and those look identical in a log.
+    local inCand = false
+    for _, m in ipairs(Core.enumerateCandidates()) do
+        if m == c then inCand = true break end
+    end
+    out = out .. ("\n  candidate: %s"):format(inCand and "yes" or "NO — not enumerated")
+
+    -- Geometry against the cone the class in hand actually uses.
+    local fromPos, look = aimOrigin(nil)
+    local ph = c:FindFirstChild("HumanoidRootPart")
+    if fromPos and look and ph then
+        local dir = ph.Position - fromPos
+        local dist = dir.Magnitude
+        local ang = math.deg(math.acos(math.clamp(look:Dot(dir.Unit), -1, 1)))
+        local fov = (S.lastBoltFov or T.lockFovDeg) * (T.lockFovScale or 1)
+        if Core.overrideActive() then fov = fov * (T.lockFovBoostMult or 1) end
+        local cap = S.lastBoltRange or T.lockRange
+        out = out .. ("\n  geometry: %.0f studs (cap %.0f -> %s), %.0f deg (cone %.0f -> %s), los=%s")
+            :format(dist, cap, dist <= cap and "in" or "TOO FAR",
+                ang, fov, ang <= fov and "in" or "OUTSIDE",
+                Core.hasClearLos(fromPos, c, mc, nil) and "clear" or "BLOCKED")
+    else
+        out = out .. "\n  geometry: unavailable (no root part or no aim origin)"
+    end
+
+    -- Ally state, because "I give him heatseek" is the other half of the
+    -- question this command gets asked with. Assisting someone and being able to
+    -- shoot them are independent, and the engine has no filter that links them.
+    out = out .. ("\n  ally: %s (an ally is still a valid target — no filter links the two)")
+        :format(Core.isAllyPlayer(p) and "YES, echo armed for them" or "no")
+    return out
 end
 
 --------------------------------------------------------------------------
@@ -2945,6 +3320,22 @@ end
 -- the bullet's own handler. CS_CONSTRAINTS.md 6: being wrong toward the safe
 -- path costs a status effect, being wrong the other way would cost the shot.
 --------------------------------------------------------------------------
+-- DEFAULTS ONLY. There is no `enabled` field here and there must never be one.
+--
+-- High Noon used to carry its own global switch (`highnoon on`, persisted as
+-- S.highNoon, restored at boot). That was a second arming surface for something
+-- that is simply part of what COWBOY does, and it produced the exact failure it
+-- was supposed to prevent: on any machine that had never run the command -- ie.
+-- every copy of dist/cs_portable.lua -- pressing F did nothing and said nothing.
+--
+-- It is now armed by the class, like every other class behaviour: `hs COWBOY`.
+-- The gate in noteCastWindow reads `trig.owner.enabled`, which registerClass
+-- forces to false at registration and never restores from disk, so the "must
+-- not come up hot on inject" requirement is satisfied by the SAME mechanism
+-- that satisfies it for steering, rather than by a rule of its own.
+--
+-- Per-class overrides live in the class entry (castTrigger.highNoon in
+-- cs_classes.lua). Anything absent there falls back to these.
 local HIGH_NOON = {
     template = "attack",   -- resolved against the caster's own class folder
     speed    = 1200,       -- hitscan-looking; well past any steerable range
@@ -2954,10 +3345,6 @@ local HIGH_NOON = {
     -- §5b forbids.
     shots    = 1,          -- bullets per cast
     gapSec   = 0.06,       -- spacing when shots > 1
-    -- OFF until asked for. This SPAWNS bodies, so it is the one switch that
-    -- must never come up hot on inject -- being wrong here puts projectiles in
-    -- the world rather than merely mis-steering one.
-    enabled  = false,
     -- How far an ally-cast round must get from its caster before it may touch
     -- anything. Its own constant rather than ECHO_CLEAR_STUDS, which is a local
     -- declared ~2300 lines below this point and would read as a nil global here.
@@ -2966,10 +3353,24 @@ local HIGH_NOON = {
 }
 Core.highNoon = HIGH_NOON
 
-function Core.setHighNoon(on)
-    HIGH_NOON.enabled = on and true or false
-    Log.info("high noon " .. (HIGH_NOON.enabled and "ON" or "off"))
-    return HIGH_NOON.enabled
+-- Resolve the effective High Noon config for a class. Field-by-field over the
+-- defaults, not `classTable or HIGH_NOON`: a class that overrides one number
+-- would otherwise silently lose every field it did not restate.
+-- On Core, not a chunk-level `local`: cs_core.lua is at Luau's 200 top-level
+-- local ceiling, and adding the 201st makes Potassium refuse the whole engine
+-- while luau-compile still reports it clean (HANDOFF_2026-08-01 §2). Measured,
+-- not guessed -- this function was written as a local first and the build
+-- warning caught it.
+function Core.highNoonCfg(cfg)
+    local hn = cfg and cfg.castTrigger and cfg.castTrigger.highNoon
+    if not hn then return HIGH_NOON end
+    return {
+        template   = hn.template   or HIGH_NOON.template,
+        speed      = hn.speed      or HIGH_NOON.speed,
+        shots      = hn.shots      or HIGH_NOON.shots,
+        gapSec     = hn.gapSec     or HIGH_NOON.gapSec,
+        clearStuds = hn.clearStuds or HIGH_NOON.clearStuds,
+    }
 end
 
 -- Apply Burn to whoever this bullet hit.
@@ -3077,7 +3478,8 @@ local function templateFrom(marker, name)
     return folder:FindFirstChild(name)
 end
 
-local function highNoonShot(tgt, myChar, fromRoot, template, casterChar)
+local function highNoonShot(tgt, myChar, fromRoot, template, casterChar, hn)
+    hn = hn or HIGH_NOON
     local root = fromRoot or (myChar and myChar:FindFirstChild("HumanoidRootPart"))
     local th = tgt and tgt:FindFirstChild("HumanoidRootPart")
     if not (root and th) then return nil, "no root" end
@@ -3090,11 +3492,11 @@ local function highNoonShot(tgt, myChar, fromRoot, template, casterChar)
         -- An Instance when we resolved one from the caster's folder, with
         -- rawTemplate so CreateProjectile does not re-resolve it against US.
         -- Falls back to the string, which is correct for our own casts.
-        template    = template or HIGH_NOON.template,
+        template    = template or hn.template,
         rawTemplate = (template ~= nil) or nil,
         cframe      = cf,
         options  = {
-            Speed = HIGH_NOON.speed,
+            Speed = hn.speed,
             Range = T.highNoonRange,
             -- One target per bullet. Without it a hitscan round can chain
             -- through a crowd, which is neither asked for nor subtle.
@@ -3135,7 +3537,7 @@ local function highNoonShot(tgt, myChar, fromRoot, template, casterChar)
                 local r = casterChar and casterChar:FindFirstChild("HumanoidRootPart")
                 local clear = true
                 if r and r.Parent then
-                    clear = (proj.Position - r.Position).Magnitude >= HIGH_NOON.clearStuds
+                    clear = (proj.Position - r.Position).Magnitude >= hn.clearStuds
                 end
                 if clear ~= live then
                     live = clear
@@ -3157,10 +3559,25 @@ end
 -- The body is owned by US either way (spawnHit forces asPlayer = nil), because
 -- Owner is snapshotted at handler start (0463.lua:12) and only the owner's
 -- client resolves the hit. A body owned by the ally would be visual-only.
-function Core.fireHighNoon(caster, marker)
+-- `cfg` is the class that owns the trigger. Passed in by noteCastWindow, which
+-- already resolved it; resolved from OUR class when called by hand, which is
+-- the only other caller and is always a self-cast.
+function Core.fireHighNoon(caster, marker, cfg)
     caster = caster or lp
     local myChar = char()
     if not myChar then return false, "no character" end
+
+    cfg = cfg or S.aliasMap[myClass()]
+    if not (cfg and cfg.castTrigger) then
+        return false, "current class has no high noon cast"
+    end
+    -- Armed by the class, never by a switch of its own. Checked here as well as
+    -- in noteCastWindow so the manual command cannot bypass what `hs COWBOY`
+    -- means -- one arming surface, no back door.
+    if not cfg.enabled then
+        return false, ("%s is not armed -- `hs %s`"):format(cfg.name or "class", cfg.name or "CLASS")
+    end
+    local hn = Core.highNoonCfg(cfg)
 
     local casterChar = (caster == lp) and myChar or (caster and caster.Character)
     local casterRoot = casterChar and casterChar:FindFirstChild("HumanoidRootPart")
@@ -3169,7 +3586,7 @@ function Core.fireHighNoon(caster, marker)
     -- Their bullet, in their skin. nil for our own casts, where the string form
     -- already resolves correctly -- and nil if the marker has no usable
     -- SourceObj, which falls back to the string rather than refusing the shot.
-    local template = templateFrom(marker, HIGH_NOON.template)
+    local template = templateFrom(marker, hn.template)
     if caster ~= lp and not template then
         logx("cast", ("high noon [%s] — no template from marker, using ours")
             :format(caster.Name))
@@ -3213,18 +3630,18 @@ function Core.fireHighNoon(caster, marker)
     end
 
     local fired = 0
-    for i = 1, math.max(1, HIGH_NOON.shots) do
-        local proj, why = highNoonShot(tgt, myChar, casterRoot, template, casterChar)
+    for i = 1, math.max(1, hn.shots) do
+        local proj, why = highNoonShot(tgt, myChar, casterRoot, template, casterChar, hn)
         if proj then
             fired = fired + 1
         elseif why then
             Log.warn("high noon: " .. why)
         end
-        if i < HIGH_NOON.shots then task.wait(HIGH_NOON.gapSec) end
+        if i < hn.shots then task.wait(hn.gapSec) end
     end
 
     logx("cast", ("high noon [%s] — %d shot(s) at %s speed=%d")
-        :format(caster.Name, fired, tgt.Name, HIGH_NOON.speed))
+        :format(caster.Name, fired, tgt.Name, hn.speed))
     return fired > 0, ("high noon x%d -> %s"):format(fired, tgt.Name)
 end
 
@@ -3923,26 +4340,52 @@ local function noteCastWindow(proj, owner)
     -- because we cannot see their keyboard. A marker is owner-stamped and every
     -- player's bodies come through this same watcher, so self and ally are the
     -- same code path with no extra machinery.
+    -- The enabled check sits INSIDE the ownership test below, not here. Every
+    -- COWBOY on the server emits this body, so testing `enabled` first would
+    -- mean the OFF branch (which logs) ran for strangers too.
     local trig = castWin.triggers[name]
-    if trig and HIGH_NOON.enabled and trig.owner and ownedByClass(trig.owner) then
+    if trig and trig.owner and ownedByClass(trig.owner) then
         -- Only for us or for someone we are actually assisting. Every COWBOY on
         -- the server emits this body, and forging a shot for a stranger's cast
         -- is both pointless and a lot of projectiles.
         local mine = (owner == lp)
         if mine or (Core.allyHeatseekEnabled() and Core.isAllyPlayer(owner)) then
-            -- One shot per cast. criticalshow can appear more than once per
-            -- High Noon (skin variants each carry their own copy), and without
-            -- this a single F would fire a burst per duplicate body.
-            local last = castWin.firedAt[owner]
-            local now = os.clock()
-            if not last or (now - last) > (trig.cooldown or 1.0) then
-                castWin.firedAt[owner] = now
-                task.spawn(function()
-                    -- `proj` is the marker body; fireHighNoon reads the caster's
-                    -- own bullet template out of it.
-                    local ok, why = pcall(Core.fireHighNoon, owner, proj)
-                    if not ok then Log.err("high noon error", why) end
-                end)
+            if not trig.owner.enabled then
+                -- SILENT GATE, said out loud. The class is not armed, so the
+                -- cast is correctly ignored -- but it used to be ignored in
+                -- total silence, which reads as "the script is broken" rather
+                -- than "turn the class on". HANDOFF_2026-08-01 §4: a gate with
+                -- no name in the log is a multi-session bug.
+                --
+                -- Scalar on castWin, not a table keyed by owner. Two reasons:
+                -- there is at most one caster this can fire for (we are already
+                -- inside the self/ally test), and an owner-keyed table here
+                -- would hold a strong reference to every player who has cast.
+                -- No chunk-level `local` either -- cs_core.lua is at Luau's
+                -- 200 top-level-local ceiling (HANDOFF_2026-08-01 §2).
+                local now = os.clock()
+                if not castWin.hintedAt or (now - castWin.hintedAt) > 30 then
+                    castWin.hintedAt = now
+                    Log.warn(("high noon: %s cast detected but %s is not armed"
+                        .. " -- `hs %s`"):format(proj.Name,
+                        trig.owner.name or "the class", trig.owner.name or "CLASS"))
+                end
+            else
+                -- One shot per cast. criticalshow can appear more than once per
+                -- High Noon (skin variants each carry their own copy), and
+                -- without this a single F would fire a burst per duplicate body.
+                local last = castWin.firedAt[owner]
+                local now = os.clock()
+                if not last or (now - last) > (trig.cooldown or 1.0) then
+                    castWin.firedAt[owner] = now
+                    task.spawn(function()
+                        -- `proj` is the marker body; fireHighNoon reads the
+                        -- caster's own bullet template out of it.
+                        local ok, why = pcall(Core.fireHighNoon, owner, proj,
+                                                      trig.owner)
+                        if not ok then Log.err("high noon error", why) end
+                    end)
+                end
             end
         end
     end
@@ -4963,7 +5406,7 @@ local function telemFlightEnd(rec, proj, outcome)
     end
 
     -- (2) Curved too far in total.
-    local devBudget = T.legitMaxTotalDeviationDeg
+    local devBudget = tl.devBudget or T.legitMaxTotalDeviationDeg
     if aimDev > devBudget then
         score = score - 25
         L.tells.overDeviated = L.tells.overDeviated + 1
@@ -5113,6 +5556,12 @@ local function steer(proj, cfg, ctx)
     rec.tl.bodyName = proj.Name
     rec.tl.boltSpeed = projSpeed(proj)
     rec.tl.boltRange = projRange(proj)
+    -- Recorded per flight so the GRADE is measured against the budget this body
+    -- actually had. Without it a body with a raised lockDev is scored against
+    -- the global 55, reported as "deviated 62deg (budget 55deg)", and dragged to
+    -- a B for spending exactly what it was allowed -- the metric contradicting
+    -- the config. legitStats reads tl, not cfg, so it has to travel on the record.
+    rec.tl.devBudget = Core.lockDevFor(cfg, proj)
     -- Echo-transport trial bookkeeping. hits0 is the server-confirmed hit
     -- counter at launch: Core.stats.hits only moves on a DamageIndicator that
     -- named US as dealer (see watchDamageIndicator), so the delta over this
@@ -5162,8 +5611,22 @@ local function steer(proj, cfg, ctx)
     -- Speed is passed so the lock margin can size itself against THIS bolt --
     -- a slow body must lock a tighter cone than a fast one or it spends the
     -- whole deviation budget getting there. See pickTarget.
-    local tgt = Core.pickTarget(reachFor(cfg, proj, projRange(proj)), mc, ctx, lockFovFor(cfg, proj),
-        castWindowCloseLock(cfg, ctx and ctx.allyPlayer or lp), nil, projSpeed(proj))
+    -- Drone/turret bodies: search from where the BODY is and where it is going,
+    -- not from the player's root and camera. Only applied when no ctx already
+    -- carries an origin (an ally echo's origin is the ALLY's muzzle and is
+    -- already correct). See lockFromBody.
+    local lockCtx = ctx
+    if not (ctx and ctx.originPos) and Core.lockFromBody(cfg, proj)
+        and initLook and initLook.Magnitude > 1e-3 then
+        lockCtx = { originPos = proj.Position, originLook = initLook.Unit }
+        logx("lock", ("#%d %s origin from body @%.0f studs from me")
+            :format(castId, proj.Name,
+                (mc and mc:FindFirstChild("HumanoidRootPart"))
+                    and (proj.Position - mc.HumanoidRootPart.Position).Magnitude or -1))
+    end
+    local tgt = Core.pickTarget(reachFor(cfg, proj, projRange(proj)), mc, lockCtx, lockFovFor(cfg, proj),
+        castWindowCloseLock(cfg, ctx and ctx.allyPlayer or lp), nil, projSpeed(proj),
+        Core.lockDevFor(cfg, proj))
     if not tgt then
         telemFlightEnd(rec, proj, "no target")
         Core.unregister(proj, "no target")
@@ -5196,6 +5659,9 @@ local function steer(proj, cfg, ctx)
     -- Once set, the bolt flies straight for the rest of the flight. Set by the
     -- deviation budget and by the terminal freeze; never cleared, because a bolt
     -- that stops correcting and then starts again is worse than either.
+    -- 1 = full authority, 0 = fully handed back. Driven by the return fade band
+    -- above; a function-local, so it costs nothing against the chunk's 200.
+    local returnFade = 1
     local steerFrozen = false
     local repicked = false
     local freezeWhy = nil
@@ -5309,6 +5775,28 @@ local function steer(proj, cfg, ctx)
                 if maxTravel > RETURN_ARM_DIST and d < RETURN_TRIP_DIST then
                     outcome = "returned to owner" ; break
                 end
+                -- SMOOTH HANDOVER, not a cliff.
+                --
+                -- The line above ends the flight the instant the ball is inside
+                -- RETURN_TRIP_DIST. Up to that frame we steered at full
+                -- authority; on it, we stop dead. The game's own return script
+                -- then takes a body that was being actively turned and yanks it
+                -- onto its own path -- a visible kink at exactly the moment the
+                -- ball is closest to the player and most watched. That is the
+                -- "sketchy return" report.
+                --
+                -- So authority fades to zero across the band between the arm
+                -- distance and the trip distance, and the game's path takes over
+                -- a body that is already coasting. Nothing about WHEN the flight
+                -- ends changes -- only how much we are still contributing when
+                -- it does.
+                local fadeAt = T.legitReturnFadeStuds or 20
+                if maxTravel > RETURN_ARM_DIST and d < fadeAt then
+                    local span = math.max(fadeAt - RETURN_TRIP_DIST, 1e-3)
+                    returnFade = math.clamp((d - RETURN_TRIP_DIST) / span, 0, 1)
+                else
+                    returnFade = 1
+                end
             end
         end
 
@@ -5385,12 +5873,20 @@ local function steer(proj, cfg, ctx)
         -- `stopWhenReturningToOwner` -- which arms on travel and fires on
         -- closeness -- would end the flight as "returned to owner" before the
         -- kick ever happened.
+        -- PER BODY. This was read straight off cfg.flight, which is class-wide,
+        -- so JESTER's 12-stud ride gate also held its m1 unsteered for the first
+        -- 12 studs of every bolt -- and while `ridden` is true the flight
+        -- baselines below are RESET every frame, so the m1's guided window kept
+        -- restarting. Measured: JESTER firstSteer averaged 172ms across 11
+        -- flights this session and 173ms across 205 in the previous one, against
+        -- 26-36ms for every other class. It was the only class with this flag.
+        -- That is HANDOFF_2026-08-01 open item 7, and this is the cause.
         local ridden = false
-        if cfg.flight.steerAfterOwnerStuds and mc then
+        local rideStuds = Core.steerAfterOwnerStudsFor(cfg, proj)
+        if rideStuds and mc then
             local oroot = mc:FindFirstChild("HumanoidRootPart")
             if oroot then
-                ridden = (proj.Position - oroot.Position).Magnitude
-                    < cfg.flight.steerAfterOwnerStuds
+                ridden = (proj.Position - oroot.Position).Magnitude < rideStuds
             end
         end
 
@@ -5547,10 +6043,43 @@ local function steer(proj, cfg, ctx)
                     else
                         local dev = math.deg(math.acos(
                             math.clamp(launchDir:Dot(current.Unit), -1, 1)))
-                        if rec.tl and dev > (rec.tl.devMax or 0) then
+                        -- devMax STOPS at the freeze. Past that point we are
+                        -- not steering, so anything the heading does next is the
+                        -- GAME moving the body -- and for a boomerang that is a
+                        -- full turn for home.
+                        --
+                        -- This is what digest section 6 has been reporting all
+                        -- along. Measured: `dev=158/55 turn=30 froze=dev 30°`
+                        -- -- our total contribution was 30 degrees, the freeze
+                        -- fired correctly, and the 158 is JESTER's m1 flying
+                        -- back to the thrower afterwards. Section 6 was never
+                        -- showing a clamp leak (HANDOFF_2026-08-01 open item 6);
+                        -- it was showing the return leg of bodies we had already
+                        -- let go of. Recording it as deviation WE spent made
+                        -- every returning body look like a runaway.
+                        if rec.tl and not steerFrozen
+                            and dev > (rec.tl.devMax or 0) then
                             rec.tl.devMax = dev
                         end
-                        if Core.legitNow() and dev >= T.legitMaxTotalDeviationDeg then
+                        -- Freeze AT the budget, no reserve.
+                        --
+                        -- A reserve of one frame's turn was tried and it was a
+                        -- bad trade: steerClampFor scales inversely with speed,
+                        -- so on a speed-70 bolt one frame is ~26 degrees and the
+                        -- reserve retired 45% of the budget. Measured on the
+                        -- build that shipped it: `froze=dev 30°` against 55, and
+                        -- `froze=dev 52°` against 78 -- the Q ball stopping at
+                        -- two thirds of a budget that had just been raised
+                        -- specifically to let it track. Reported, correctly, as
+                        -- "didn't feel a difference".
+                        --
+                        -- No reserve is needed: clampSteer(launchDir, look,
+                        -- budget) below already bounds the heading actually
+                        -- WRITTEN to the budget, every frame. The reserve was
+                        -- guarding against an overshoot that the clamp prevents
+                        -- and the telemetry was only appearing to show.
+                        if Core.legitNow()
+                            and dev >= Core.lockDevFor(cfg, proj) then
                             steerFrozen = true
                             freezeWhy = ("dev %.0f°"):format(dev)
                             return
@@ -5620,6 +6149,10 @@ local function steer(proj, cfg, ctx)
                 end
 
                 local clampDeg = steerClampFor(sp, sinceSpawn, steerEvery, budget)
+                -- Fades our turn rate out as a boomerang comes home, so the
+                -- game's return script takes over a coasting body rather than a
+                -- turning one. 1 for every body that is not returning.
+                clampDeg = clampDeg * returnFade
                 -- FRAME-RATE NORMALISED. The clamp is named per-FRAME and was
                 -- applied per frame, so the real turn rate scaled with fps:
                 -- 20 deg/frame for a speed-100 bolt is ~1200 deg/s at 60fps and
@@ -5650,7 +6183,7 @@ local function steer(proj, cfg, ctx)
                 -- budget away from where the player aimed" is enforced on the
                 -- value actually written, once, in one place.
                 if launchDir and Core.legitNow() then
-                    look = clampSteer(launchDir, look, T.legitMaxTotalDeviationDeg)
+                    look = clampSteer(launchDir, look, Core.lockDevFor(cfg, proj))
                 end
 
                 -- NO output filter here. This is deliberate and it must stay that
@@ -8540,6 +9073,25 @@ Core.registerClass("COWBOY", {
         -- it or every second shot is swallowed. 0.2 still collapses the
         -- duplicate bodies that skin variants emit within a frame of each other.
         cooldown = 0.2,
+        -- The forged round itself. It lives HERE, in the class, because it is
+        -- part of what COWBOY does -- not a feature with a switch of its own.
+        --
+        -- It used to have one: `highnoon on|off`, persisted to the config file
+        -- and restored at boot, plus its own panel row. Two arming surfaces for
+        -- one behaviour, and the second one defaulted OFF on any machine whose
+        -- config file had never seen it -- which is every copy of
+        -- dist/cs_portable.lua we hand out. Pressing F did nothing and said
+        -- nothing. Now `hs COWBOY` arms the class and the round together, the
+        -- same single act that arms steering for every other class, and
+        -- registerClass's `cfg.enabled = false` keeps it cold on inject.
+        --
+        -- Anything omitted falls back to the HIGH_NOON defaults in cs_core.
+        highNoon = {
+            template = "attack",  -- CONFIRMED in the 2026-07-31 body census
+            speed    = 1200,      -- hitscan-looking; past any steerable range
+            shots    = 1,         -- one round per Sharpshooter shot
+            gapSec   = 0.06,
+        },
     },
     deny    = {
         "ability1",  -- Q Reloading Roll — reload/dash, no damage bolt (0566.lua:417-420)
@@ -9514,8 +10066,69 @@ Core.registerClass("JESTER", {
         -- (muzzle delay, LOS arm, deviation budget, boomerang arm) all start
         -- from there. 12 studs clears a giant ball with somebody standing on it
         -- without waiting so long that the kicked shot loses its guided window.
-        steerAfterOwnerStuds = 12,
+        --
+        -- PER BODY, and that is the fix for HANDOFF_2026-08-01 open item 7.
+        -- This was a bare number, which cs_core read as class-wide, so the m1
+        -- was ALSO held unsteered for its first 12 studs -- and because the
+        -- ridden branch resets the flight baselines every frame, its guided
+        -- window kept restarting. JESTER first-steered at 172ms (n=11) and
+        -- 173ms (n=205 the session before) against 26-36ms for every other
+        -- class, and it was the only class carrying this flag. `ability1new`
+        -- is listed too: if it turns out to be the kicked ball, it is ridden
+        -- for exactly the same reason.
+        steerAfterOwnerStuds = { ability1 = 12, ability1new = 12 },
     },
+
+    -- LOCK REACH, per body. Shortens what the lock will REACH FOR; the bolt
+    -- itself is untouched and flies exactly as far as it always did.
+    --
+    -- Measured this session, and it is the whole "sketchy at range" report:
+    -- five `attack` flights, every one `froze=dev` at 56-66 against a 55
+    -- budget, all graded legit=75(B) -- while the two Q balls that stayed
+    -- inside their budget graded 90(A) and 100(A). The bolt was locking
+    -- targets it could only reach by spending the entire deviation budget,
+    -- which is a miss manufactured at lock time (see pickTarget's own note on
+    -- exactly this failure).
+    --
+    --   attack   0.85  -- m1, the 15% cut asked for. JESTER only.
+    --   ability1 0.55  -- Q ball. The ask was "short cone but CLOSE": the ball
+    --                     rides you into the air and is enormous, so a lock at
+    --                     the far end of a learned reach of 177 studs is the
+    --                     one that looks worst. Cutting reach rather than
+    --                     widening the cone keeps it honest up close, where it
+    --                     already grades A, and simply refuses the far shots.
+    lockReachScale = { attack = 0.85, ability1 = 0.55, ability1new = 0.55 },
+
+    -- Cone, per body. Tighter than the global 49 for both, because JESTER is
+    -- the class pickTarget's lock-margin note is written about: it locks at
+    -- 41-48 degrees and SPENDS 55-62, the widest lock-to-spend gap in the
+    -- roster, because the gap scales as atan(drift / boltSpeed) and JESTER is
+    -- the slowest bolt (speed 70). A cone it can actually steer to is worth
+    -- more than a wide one it abandons mid-flight.
+    lockFov = { attack = 30, ability1 = 52, ability1new = 52 },
+
+    -- DEVIATION BUDGET, per body. This is the knob that makes the Q track
+    -- someone BELOW and in front of you, and the cone above is useless without
+    -- it -- pickTarget clamps every cone to `budget - margin`, so at the global
+    -- 55 budget this body's ceiling is 55 - (6 + atan(16/70)) = 36 degrees and a
+    -- lockFov of 52 would simply be clamped back to 36, exactly as the previous
+    -- 38 was. Nothing about the cone alone can move it.
+    --
+    -- 78 puts the ceiling at 59 degrees, which covers the shape actually being
+    -- missed: the ball carries you into the air, so targets sit 40-55 degrees
+    -- below the aim axis at 10-20 studs. The cone is then set just under that
+    -- ceiling so the number in the config is the number in force.
+    --
+    -- THE TRADE, stated plainly: this body may now hook up to 78 degrees, and
+    -- that is a lot of curvature. It is confined to `ability1` -- the m1 stays
+    -- at the global 55 with a 30 degree cone, tighter than before -- and it is
+    -- deliberately spent on the case where it reads best. Per the user, close
+    -- range is where the Q already looks legit; the far shots were the sketchy
+    -- ones, and lockReachScale 0.55 above is what refuses those.
+    --
+    -- If it starts looking wrong, `hstune` cannot reach a per-body value -- edit
+    -- this number and rebuild, or drop the entry to fall back to the global.
+    lockDev = { ability1 = 78, ability1new = 78 },
     deny    = {
         "ability2",   -- E Comedic Banana — ground trap / heal pickup
         "ability3",   -- R slot — kit has no AB3; belt-and-braces
@@ -9871,11 +10484,31 @@ Core.registerClass("MERCENARY", {
     },
 })
 
--- SANTA — registered with an EMPTY allow list on purpose, same as MERCENARY.
--- This class has MODES, so read the mode section before filling anything in.
+-- SANTA — `allow` filled from LIVE CAPTURE (cs_core.log, 02:38). Before this it
+-- was empty, which fails closed, so the class claimed nothing and silently did
+-- nothing in play. This class has MODES: read the mode section before adding.
 --
--- SANTA is in the dump's "ABSENT (69)" list with no module and no log lines, so
--- there are no body names anywhere yet and nothing here is guessed.
+-- SANTA is in the dump's "ABSENT (69)" list with no module, so every name below
+-- comes from a `SELF BODY` line, not from convention. What one Rapidfire-mode
+-- session printed:
+--
+--   attack1          Speed=110 Range=50  Damage=5   -> ATK Rapidfire snowball.
+--                                                      Travels, damages, matches
+--                                                      the kit's 5 dmg. ALLOWED.
+--   SantaPresent     Speed=50  Range=30  Damage=8   -> AB2 Christmas Gift. Lands
+--                                                      and waits. DENIED (by the
+--                                                      `present` substring).
+--   bigsnowball      Speed=50  Range=100 Damage=15  -> AB1 Rapidfire drag ball.
+--                                                      HELD BACK on legitness,
+--                                                      denied by name below.
+--   criticaleffoff   Speed=0 ANCHORED               -> CRT mode-switch vfx.
+--   criticaleff1     (same shape)                      Both denied by `critical`.
+--
+-- STILL UNCAPTURED: the Spray and Longshot bodies of ATK, and the AB1 Spray
+-- gusts. `allow` is exact-match, so those stay unclaimed until someone fires
+-- them and reads the log — that is the intended failure mode, not a bug. Do NOT
+-- guess `attack2` / `attack3`: `attack` / `critical` / `ability2` have been
+-- wrong seven times in this file.
 --
 -- THE MODES ARE THE WHOLE PROBLEM. CRT "Setting Switch" (0.1s cooldown) cycles
 -- the Chimney Launcher between Rapidfire / Spray / Longshot, and BOTH ATK and
@@ -9900,12 +10533,12 @@ Core.registerClass("MERCENARY", {
 -- each mode separately — fire ATK, press CRT, fire ATK again, three times round
 -- — and read every distinct `SELF BODY` line before writing the list.
 --
--- TO FINISH IT:
---   1. Play SANTA. Fire ATK in all three modes, cycling with CRT between each.
+-- TO FINISH IT (Rapidfire ATK is done; the other two modes are not):
+--   1. Play SANTA. Fire ATK in Spray and in Longshot, cycling with CRT.
 --   2. Fire AB1 in Spray mode as well.
 --   3. grep "SELF BODY" cs_core.log — each prints name + Speed/Range/Damage.
---   4. Allow the ATK bodies (5 dmg, 3 dmg, and the 10-30 icicle) and the AB1
---      Spray gusts. Leave everything else out.
+--   4. Add the ATK bodies (the 3 dmg wind and the 10-30 icicle) and the AB1
+--      Spray gusts to `allow`. Leave everything else out.
 --
 -- WHAT MUST NEVER BE STEERED, and why each one is a shape already paid for:
 --
@@ -9923,7 +10556,7 @@ Core.registerClass("MERCENARY", {
 --    thing a victim reports. If you want it, it is the user's call, not a
 --    default -- see the ban note in HANDOFF_2026-07-31_EVENING.md §1.
 --
--- TWO THINGS TO EXPECT WHEN YOU DO FILL IT IN:
+-- TWO THINGS TO EXPECT NOW THAT IT CLAIMS:
 --  * Rapidfire is 3 bolts and Spray is 4, both above the default per-cast echo
 --    budget of 2 (Core.setMaxEchoesPerCast). An ally's SANTA will forge only two
 --    of them until that is raised. Raise the budget -- do NOT loosen `allow`.
@@ -9933,13 +10566,126 @@ Core.registerClass("MERCENARY", {
 Core.registerClass("SANTA", {
     aliases = { "SANTA" },
     accept  = Core.gates.classProvenance,
-    allow   = {},   -- INTENTIONALLY EMPTY — fails closed. See above.
+    -- Live-captured ATK Rapidfire snowball. Spray/Longshot bodies are still
+    -- unnamed and stay unclaimed until the census prints them.
+    allow   = { "attack1" },
     deny    = {
-        "gift", "present",      -- AB2: lands and waits to be touched
+        "gift", "present",      -- AB2: lands and waits to be touched (SantaPresent)
         "ability2",             -- AB2 slot, until the present body is named
         "cursor",               -- AB1 Longshot strikes the cursor position
+        "bigsnowball",          -- AB1 Rapidfire drag ball, named from the census
         "drag", "grab",         -- AB1 Rapidfire snowball carries a real player
         "critical",             -- CRT is a mode switch, emits no bolt
+        "eff", "cosmetic", "visual", "model",
+    },
+})
+
+--------------------------------------------------------------------------
+-- CONTROLLER — the drone class. ONE steerable body out of fourteen, and the
+-- reason it is worth this much text is that NONE of the usual assumptions hold:
+-- the thing that shoots is not the player, and the thing that flies is not
+-- always a bolt.
+--
+-- Kit (0567.lua:348). CAT=SUPPORT. Passive "Drone Control": a drone follows a
+-- MARKER you place in front of yourself, and every slot is a COMMAND to it.
+-- CRT "Change Mode" swaps Combat/Movement, so like SANTA each slot has two
+-- meanings — but unlike SANTA the Movement half emits no damaging body at all,
+-- which is what makes the split tractable here:
+--
+--   ATK Combat  "Shoot"        stop the drone, fire 4 bullets, 5 dmg each
+--   ATK Move    "Hover"        move/teleport the drone to the marker
+--   AB1 Combat  "Supply Pulse" pulse AROUND THE DRONE, knockback + heal
+--   AB1 Move    "Closer"       move the marker in
+--   AB2 Combat  "EMP"          shockwave toward the MARKER, PIERCES TERRAIN,
+--                              applies Disable (1.5s)
+--   AB2 Move    "Further"      move the marker out
+--   CRT         "Change Mode"  mode swap, no projectile
+--
+-- MEASURED, from the archive folder listing (archives/…_2026-07-31_144117/
+-- classes_projectiles.txt:55) — 14 bodies, so nothing below is a convention
+-- guess:
+--
+--   attack           Speed=125 Range=50  Damage=5   -> ALLOWED, the only one
+--   ability2         Speed=150 Range=100 Damage=5   -> DENIED, see below
+--   ability1         Speed=0 ANCHORED   Damage=8    -> Supply Pulse aura
+--   ability2eff/effbig  ANCHORED CanTouch=false     -> vfx
+--   hovereff         ANCHORED CanTouch=false        -> vfx
+--   drone            Speed=100 Range=0  no Damage   -> THE DRONE ITSELF
+--   droneremove      Speed=70  Range=0  no Damage   -> despawn body
+--   commandemp / commandhover / commandshoot / commandsupply / commandteleport
+--                    Speed=0 ANCHORED, ReplicateCFrame -> command signals
+--   DroneModel [Model]                              -> not a part at all
+--
+-- `attack` matches the kit's 4x5 exactly and is the ONLY body here that both
+-- travels and damages on contact.
+--
+-- WHY `drone` IS THE HARDEST DENY ON THE ROSTER. It carries Speed=100 and so
+-- passes the generic "is it a bolt" shape the way GAMBLER's particle signals
+-- do, and it is a body of ours that genuinely moves — but it is the class's
+-- PET, not a shot. Writing a mover to it steers the player's own drone into
+-- whatever the lock picked: the TRICKSTER Magic Baton / PHANTOM Sinister Mirage
+-- failure, one step removed. It also has Range=0, so reachFor would give it the
+-- fallback lock range and it would chase across the map. Denied by name, and
+-- `droneremove` with it. CanTouch=false on both is the tell: a body that cannot
+-- touch anything cannot be a damage bolt.
+--
+-- WHY AB2 EMP IS DENIED even though it looks like the best body on the class
+-- (Speed=150, Range=100, travels, damages). Two independent reasons, either one
+-- sufficient:
+--   1. It is launched TOWARD YOUR MARKER, a position the player placed. The
+--      marker IS the aim, exactly as SANTA's AB1 Longshot cursor and PROGRAMMER's
+--      Return Zero. Steering it moves the shockwave off the spot the player
+--      pointed at, so the assist actively fights the player's own placement.
+--   2. It applies Disable (1.5s). A curving projectile that removes someone's
+--      abilities is the `stun` surface CS_CONSTRAINTS holds back on legitness
+--      grounds — the loudest possible thing to be seen bending.
+-- It PIERCES TERRAIN, which also means the line-of-sight gate is meaningless
+-- for it: our targeting would happily lock through a wall it can legitimately
+-- cross, so its rejects would read nothing like every other body's.
+--
+-- THE ORIGIN PROBLEM — this is the real work, and it is engine-side.
+-- `attack` spawns AT THE DRONE, which hovers at the marker: routinely 30-60
+-- studs from the player and facing wherever the drone was told to face. The
+-- self targeting path anchors its cone at the PLAYER's root and camera look, so
+-- for this class alone the search was being run from a point the bullets do not
+-- come out of. That is the third-person-camera-offset bug in a worse form: not
+-- a 12-stud error but an arbitrary one, in position AND direction.
+-- `lockFromBody = { "attack" }` switches this body to the origin the ally-echo
+-- path and the mid-flight relock already use — the body's own position and
+-- heading. Without it the class is not "slightly off", it locks nothing.
+--
+-- The cone stays at whatever the global is: the drone's own facing is a real
+-- aim, so a strict cone measured from IT is meaningful. Widening the cone was
+-- the wrong fix for the same reason it was wrong for MEDIC — the origin was
+-- broken, not the aperture.
+--
+-- EXPECT: 4 bullets per cast on a 0.6s cooldown. That is a VOLLEY, not the
+-- duplicate-projectile bug, and it is above the per-cast ally echo budget of 2
+-- (Core.setMaxEchoesPerCast), so an ally CONTROLLER mirrors two of four until
+-- that is raised. Raise the budget — do not loosen `allow`.
+--
+-- UNVERIFIED: every value above is from the ARCHIVE folder, not from a live
+-- `SELF BODY` census — CONTROLLER is in the "STILL MISSING" list. Skins are the
+-- known risk: the same listing shows a `ProjectileValentine` variant folder, so
+-- if a cosmetic swaps the functional body names, `attack` stops matching and the
+-- class silently does nothing. Play it once, read `CONTROLLER bodies:` at arm
+-- time, and confirm.
+--------------------------------------------------------------------------
+Core.registerClass("CONTROLLER", {
+    aliases = { "CONTROLLER" },     -- 0567.lua:348-349 (CLASS field)
+    accept  = Core.gates.classProvenance,
+    allow   = { "attack" },         -- ATK Combat-Shoot barrage, 4 x 5 dmg
+    -- The barrage leaves the DRONE, not me. See the origin section above.
+    lockFromBody = { "attack" },
+    deny    = {
+        "drone", "droneremove",     -- the pet itself: steering it flies the drone
+        "dronemodel",               -- the model container
+        "command",                  -- command*: anchored marker signals
+        "ability1",                 -- AB1 Supply Pulse: anchored aura on the drone
+        "ability2",                 -- AB2 EMP: marker-aimed + Disable + pierces
+        "emp", "pulse", "supply",   -- same moves under any other spelling
+        "hover", "teleport",        -- Movement-mode commands, nothing to steer
+        "marker",                   -- the placement reticle
         "eff", "cosmetic", "visual", "model",
     },
 })
@@ -11393,8 +12139,569 @@ end
 LOG("INIT", "v2 ready preset=%s tpl=%s spd=%s track=%s vis=%s aim=%s catalog=%d  J=fire K=unload",
     S.preset, S.templatePath, tostring(S.speed), tostring(S.track), tostring(S.vis), tostring(S.aim), #CATALOG)
 ]==]
-local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", }
-local ENGINE_BUILD = "2026-07-31 21:11:37"
+ENGINE_PAYLOAD["cs_esp.lua"] = [==[
+--------------------------------------------------------------------------
+-- cs_esp.lua — player overlay: name, health, shield, skeleton, through walls
+--
+-- Separate module, not part of cs_core, for one hard reason: cs_core.lua sits
+-- at Luau's 200-top-level-local ceiling (HANDOFF_2026-08-01.md §2) and the next
+-- chunk-level `local` added there makes Potassium refuse the whole engine while
+-- luau-compile still reports it clean. This file has its own chunk and its own
+-- budget. It also has no dependency on Core at all, so a core failure does not
+-- take the overlay with it and vice versa.
+--
+-- Loaded lazily from ENGINE_PAYLOAD by cs_admin the first time `esp` is turned
+-- on, the same mechanism as cs_projectile_forge (CS_CONSTRAINTS.md §1: one
+-- injected file, nothing for the user to load by hand).
+--
+-- WHAT IT SHOWS, and why those numbers specifically
+--
+-- The values are the ones the game itself reads, mirrored rather than
+-- re-derived:
+--
+--   health  Stats.CurrentHP / (Stats.MaxHP * Stats.MaxHPMult)   (0005.lua:468-469)
+--           colour green  Color3.fromRGB(35,255,35), grey at <= 0 (0603.lua:240)
+--   shield  Stats.CurrentShield / Stats.Shield      (0603.lua:180-186)
+--           HUD colour gold   Color3.fromRGB(255,200,35), grey at <= 0
+--           and the HUD HIDES the shield readout entirely when Stats.Shield
+--           is 0 (0603.lua:164-175) — so do we. A permanent empty gold bar on
+--           every player is noise, and it is not what the game shows.
+--
+-- DO NOT READ THE HUMANOID. This version did, and every player in the lobby
+-- and in a round read 1000/1000. `characters.txt` states the schema in its own
+-- header — "ESP / aim targeting schema (read for HP source + rig)" — and every
+-- row is `hp=<n> (Stats.CurrentHP)  HumHP=1000/1000`. The Humanoid is a fixed
+-- 1000 for every player in this game and carries no combat meaning: one row
+-- reads `HumHP=0/1000  alive=true`, so gating on Humanoid.Health also hides
+-- living players. The local HUD's `Humanoid.Health` readout (0603.lua:243) is
+-- the misleading part — it only ever renders YOUR character, where the numbers
+-- happen to be maintained. The Humanoid is kept here strictly as a fallback for
+-- non-player entities (0003.lua:5830 gives spawned entities a real one).
+--
+-- MaxHPMult is why the max is a product and not just MaxHP: upgrades scale the
+-- ceiling, so MaxHP alone reads a full bar as partial on any built character.
+--
+-- THROUGH WALLS is not an extra feature here, it is the default of both
+-- primitives used: BillboardGui.AlwaysOnTop and LineHandleAdornment.AlwaysOnTop.
+-- Note this is the OPPOSITE choice from the cone overlay, which deliberately
+-- draws its cone surface occluded so it reads as geometry in the world. There
+-- the shape is the information; here the person is, and a skeleton you lose
+-- behind a crate is worth nothing.
+--
+-- COST. This is a per-frame overlay over every player, so it is built as a
+-- pool: instances are created once, reused, and hidden rather than destroyed.
+-- Nothing allocates in the update loop except the bone position lookups.
+--------------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local LP = Players.LocalPlayer
+
+local COL_HP      = Color3.fromRGB(35, 255, 35)    -- 0603.lua:240
+local COL_SHIELD  = Color3.fromRGB(255, 200, 35)   -- 0603.lua:184
+local COL_DEAD    = Color3.fromRGB(91, 93, 105)    -- 0603.lua:238 / :182
+local COL_TEXT    = Color3.fromRGB(255, 255, 255)
+local COL_DIM     = Color3.fromRGB(170, 172, 180)  -- secondary text: distance
+local COL_BONE    = Color3.fromRGB(255, 255, 255)
+local COL_TRACK   = Color3.fromRGB(12, 12, 14)     -- bar background
+local COL_EDGE    = Color3.fromRGB(0, 0, 0)        -- outline
+
+-- SAFE was drawn in blue. It read as "decorative" against a bright game and was
+-- the first thing called out, so the whole overlay is monochrome white now with
+-- the two HUD-mirrored bar colours as the only hue — the same rule the panel
+-- follows (CS_CONSTRAINTS.md §4: black surfaces, white contrast, colour reserved
+-- for meaning). SAFE is a white pill instead, which is louder than any tint.
+
+local FOLDER_NAME = "CsEsp"
+
+-- R15 first, R6 second. Both lists are tried against every character: the game
+-- ships both rigs (dummies in the lobby are R6, players are R15) and a rig test
+-- by name is one more thing to get wrong. A bone whose parts are missing is
+-- simply skipped.
+local BONES_R15 = {
+    { "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
+    { "UpperTorso", "LeftUpperArm" }, { "LeftUpperArm", "LeftLowerArm" }, { "LeftLowerArm", "LeftHand" },
+    { "UpperTorso", "RightUpperArm" }, { "RightUpperArm", "RightLowerArm" }, { "RightLowerArm", "RightHand" },
+    { "LowerTorso", "LeftUpperLeg" }, { "LeftUpperLeg", "LeftLowerLeg" }, { "LeftLowerLeg", "LeftFoot" },
+    { "LowerTorso", "RightUpperLeg" }, { "RightUpperLeg", "RightLowerLeg" }, { "RightLowerLeg", "RightFoot" },
+}
+local BONES_R6 = {
+    { "Head", "Torso" },
+    { "Torso", "Left Arm" }, { "Torso", "Right Arm" },
+    { "Torso", "Left Leg" }, { "Torso", "Right Leg" },
+}
+
+local ESP = {}
+local S = {
+    on = false,
+    alive = true,
+    folder = nil,
+    conn = nil,
+    tags = {},          -- [Player] = { gui, name, hpFill, hpText, shRow, shFill, shText }
+    lines = {},         -- flat pool of LineHandleAdornment
+    used = 0,
+    maxDist = 500,      -- studs; beyond this a tag is unreadable anyway
+    ticks = 0,          -- frames update() has actually run. Zero is the ONLY
+                        -- honest answer to "is it drawing" before frame one.
+    scanned = 0,
+    drawn = 0,
+    diag = {},          -- per-player skip reasons, refreshed every frame
+    skeleton = true,
+    teamCheck = false,  -- hide allies. Off by default: teams.txt is empty and
+                        -- FFA characters carry no Team child at all, so a team
+                        -- filter hides nobody in the mode that is actually
+                        -- played (critical-strike skill, "Team logic").
+}
+
+local function hostUi()
+    return (gethui and gethui()) or game:GetService("CoreGui")
+end
+
+-- Swept by NAME, not by our handle. Same lesson as the cone overlay: an orphan
+-- folder belongs by definition to a module instance that is already gone, and a
+-- handle only knows about folders THIS load created. A hot reload that missed
+-- its teardown otherwise leaves a full second overlay frozen on screen.
+local function sweepOrphans()
+    local parent = hostUi()
+    for _, ch in ipairs(parent:GetChildren()) do
+        if ch.Name == FOLDER_NAME then pcall(function() ch:Destroy() end) end
+    end
+end
+
+local function ensureFolder()
+    if S.folder and S.folder.Parent then return S.folder end
+    sweepOrphans()
+    local f = Instance.new("Folder")
+    f.Name = FOLDER_NAME
+    f.Parent = hostUi()
+    S.folder = f
+    return f
+end
+
+---------------------------------------------------------------------- bones --
+
+local function line(from, to, color, thickness)
+    local n = S.used + 1
+    S.used = n
+    local a = S.lines[n]
+    if not a then
+        a = Instance.new("LineHandleAdornment")
+        a.Adornee = workspace.Terrain
+        a.AlwaysOnTop = true
+        a.ZIndex = 6
+        a.Parent = S.folder
+        S.lines[n] = a
+    end
+    local d = to - from
+    local len = d.Magnitude
+    if len < 1e-3 then a.Visible = false ; return end
+    a.Length = len
+    a.Thickness = thickness or 2
+    a.Color3 = color
+    a.CFrame = CFrame.lookAt(from, to)
+    a.Visible = true
+end
+
+local function drawSkeleton(char, color)
+    for _, set in ipairs({ BONES_R15, BONES_R6 }) do
+        for _, bone in ipairs(set) do
+            local a = char:FindFirstChild(bone[1])
+            local b = char:FindFirstChild(bone[2])
+            if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+                line(a.Position, b.Position, color, 2)
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------------- tags --
+
+-- Rounded, outlined, and the fill INSET inside its track by a pixel. The flat
+-- square frames the first version drew read as debug output: against a bright,
+-- saturated game a hard 1px colour edge with no outline vibrates and the text
+-- on top of it is unreadable at range. An outline plus a corner radius is what
+-- separates "a UI" from "two rectangles".
+local function corner(inst, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 3)
+    c.Parent = inst
+    return c
+end
+
+local function stroke(inst, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = COL_EDGE
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0.25
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = inst
+    return s
+end
+
+local function bar(parent, y, height, fillColor)
+    local track = Instance.new("Frame")
+    track.BackgroundColor3 = COL_TRACK
+    track.BackgroundTransparency = 0.25
+    track.BorderSizePixel = 0
+    track.Position = UDim2.new(0, 0, 0, y)
+    track.Size = UDim2.new(1, 0, 0, height)
+    track.Parent = parent
+    corner(track, 3)
+    stroke(track, 1, 0.15)
+
+    -- Inset by 1px on every side so the fill never touches the outline. This is
+    -- the difference between a bar that looks drawn and one that looks printed.
+    local fill = Instance.new("Frame")
+    fill.BackgroundColor3 = fillColor
+    fill.BorderSizePixel = 0
+    fill.Position = UDim2.new(0, 1, 0, 1)
+    fill.Size = UDim2.new(1, -2, 1, -2)
+    fill.Parent = track
+    corner(fill, 2)
+
+    local txt = Instance.new("TextLabel")
+    txt.BackgroundTransparency = 1
+    txt.Size = UDim2.new(1, 0, 1, 0)
+    txt.Font = Enum.Font.GothamBold
+    txt.TextSize = height - 2
+    txt.TextColor3 = COL_TEXT
+    txt.TextStrokeTransparency = 1
+    txt.ZIndex = 3
+    txt.Text = ""
+    txt.Parent = track
+    stroke(txt, 1.4, 0.1)   -- outline the glyphs, not a blurry TextStroke
+
+    return track, fill, txt
+end
+
+local function makeTag(plr)
+    local gui = Instance.new("BillboardGui")
+    gui.Name = "tag_" .. plr.Name
+    gui.AlwaysOnTop = true            -- through walls
+    gui.LightInfluence = 0
+    gui.Size = UDim2.new(0, 150, 0, 42)
+    gui.StudsOffset = Vector3.new(0, 3.0, 0)
+    gui.Parent = S.folder
+
+    -- Name row: name left, distance right, in one row rather than stacked. The
+    -- distance is the thing that decides whether a target is worth turning for,
+    -- and it costs no vertical space here.
+    local row = Instance.new("Frame")
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 15)
+    row.Parent = gui
+
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Size = UDim2.new(1, -34, 1, 0)
+    nameLbl.Font = Enum.Font.GothamBold
+    nameLbl.TextSize = 13
+    nameLbl.TextColor3 = COL_TEXT
+    nameLbl.TextStrokeTransparency = 1
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Center
+    nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    nameLbl.Position = UDim2.new(0, 17, 0, 0)
+    nameLbl.Text = plr.Name
+    nameLbl.Parent = row
+    stroke(nameLbl, 1.6, 0.05)
+
+    local distLbl = Instance.new("TextLabel")
+    distLbl.BackgroundTransparency = 1
+    distLbl.Size = UDim2.new(0, 34, 1, 0)
+    distLbl.Position = UDim2.new(1, -34, 0, 0)
+    distLbl.Font = Enum.Font.Gotham
+    distLbl.TextSize = 11
+    distLbl.TextColor3 = COL_DIM
+    distLbl.TextStrokeTransparency = 1
+    distLbl.TextXAlignment = Enum.TextXAlignment.Right
+    distLbl.Text = ""
+    distLbl.Parent = row
+    stroke(distLbl, 1.4, 0.15)
+
+    -- SAFE pill. Hidden by default, white on black, sat under the name row so
+    -- it cannot push anything around when it appears.
+    local safe = Instance.new("TextLabel")
+    safe.BackgroundColor3 = COL_TEXT
+    safe.Size = UDim2.new(0, 40, 0, 11)
+    -- Sits ABOVE the name row, outside the gui's own bounds (nothing clips —
+    -- ClipsDescendants is false), so showing it never reflows the rows below.
+    safe.Position = UDim2.new(0.5, -20, 0, -13)
+    safe.Font = Enum.Font.GothamBold
+    safe.TextSize = 9
+    safe.TextColor3 = COL_TRACK
+    safe.Text = "SAFE"
+    safe.Visible = false
+    safe.ZIndex = 4
+    safe.Parent = gui
+    corner(safe, 3)
+    stroke(safe, 1, 0.2)
+
+    local _, hpFill, hpText = bar(gui, 17, 12, COL_HP)
+    local shRow, shFill, shText = bar(gui, 30, 12, COL_SHIELD)
+
+    local t = { gui = gui, name = nameLbl, dist = distLbl, safe = safe,
+                hpFill = hpFill, hpText = hpText,
+                shRow = shRow, shFill = shFill, shText = shText }
+    S.tags[plr] = t
+    return t
+end
+
+local function dropTag(plr)
+    local t = S.tags[plr]
+    if not t then return end
+    pcall(function() t.gui:Destroy() end)
+    S.tags[plr] = nil
+end
+
+-- One decimal on current HP, integer max — exactly the HUD's own formatting
+-- (0603.lua:243), so a number read off the overlay matches the number the
+-- player themselves is looking at.
+local function fmtHp(cur, max)
+    return ("%s/%s"):format(math.floor(cur * 10 + 0.5) / 10, math.floor(max + 0.5))
+end
+
+local function statValue(char, name)
+    local stats = char:FindFirstChild("Stats")
+    local v = stats and stats:FindFirstChild(name)
+    return v and v.Value or nil
+end
+
+---------------------------------------------------------------------- update --
+
+local function update()
+    if not S.on or not S.alive then return end
+    local folder = S.folder
+    if not folder or not folder.Parent then return end
+
+    local cam = workspace.CurrentCamera
+    local myChar = LP.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    local origin = (myRoot and myRoot.Position) or (cam and cam.CFrame.Position)
+    if not origin then return end
+
+    S.used = 0
+    S.scanned, S.drawn = 0, 0
+    S.diag = {}
+    S.ticks = S.ticks + 1
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local t = S.tags[plr]
+        local char = plr.Character
+        local head = char and char:FindFirstChild("Head")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+        -- Every reason to skip lands here, and the tag is hidden rather than
+        -- destroyed: a character that is streaming in, respawning or briefly
+        -- out of range must not cost a full rebuild of its instances.
+        -- Every skip is NAMED, not counted. An anonymous histogram cannot
+        -- answer "why is this player not on my screen" — four wrong diagnoses
+        -- came out of exactly that (HANDOFF_2026-08-01.md §4), and this overlay
+        -- reproduced it immediately: `0 tagged` was reported while the real
+        -- answer was that nothing had been measured yet.
+        local show, why = true, nil
+        if plr == LP then show, why = false, "self"
+        elseif not char then show, why = false, "no character"
+        elseif not head then show, why = false, "no head (streaming?)"
+        elseif S.teamCheck and plr.Team and LP.Team and plr.Team == LP.Team then
+            show, why = false, "teammate"
+        elseif (head.Position - origin).Magnitude > S.maxDist then
+            show, why = false, ("%d studs > dist %d"):format(
+                (head.Position - origin).Magnitude, S.maxDist)
+        end
+
+        -- NO ALIVENESS GATE. The previous version hid anyone whose CurrentHP
+        -- was <= 0, which is a filter that can silently empty the whole
+        -- overlay and looks identical to the feature being broken. A dead
+        -- player draws with a grey bar instead — the HUD's own behaviour
+        -- (0603.lua:238) — because "drawn and obviously dead" is diagnosable
+        -- and "absent" is not.
+        if why then S.diag[#S.diag + 1] = plr.Name .. ": " .. why end
+        S.scanned = S.scanned + 1
+
+        if not show then
+            if t then t.gui.Enabled = false end
+        else
+            if not t then t = makeTag(plr) end
+            t.gui.Adornee = head
+            t.gui.Enabled = true
+            S.drawn = S.drawn + 1
+
+            local cur = statValue(char, "CurrentHP")
+            local max = statValue(char, "MaxHP")
+            if cur and max then
+                max = max * (statValue(char, "MaxHPMult") or 1)
+            else
+                -- No Stats folder: a spawned entity rather than a player, and
+                -- those DO carry a real Humanoid (0003.lua:5830-5831).
+                cur = cur or (hum and hum.Health) or 0
+                max = max or (hum and hum.MaxHealth) or 0
+            end
+            if max <= 0 then max = 1 end
+            local frac = math.clamp(cur / max, 0, 1)
+            t.hpFill.Size = UDim2.new(frac, 0, 1, 0)
+            t.hpFill.BackgroundColor3 = cur > 0 and COL_HP or COL_DEAD
+            t.hpText.Text = fmtHp(cur, max)
+
+            -- The HUD hides the shield readout when the player has no shield
+            -- stat at all (0603.lua:164-175); mirror that instead of drawing a
+            -- dead bar on everyone.
+            -- Two different shield schemas exist and both are live. The HUD
+            -- reads CurrentShield/Shield (0603.lua:180-186), but a freshly
+            -- spawned character in spawn_state.txt carries `Stats.ShieldHP`
+            -- (also read directly at 0393.lua:17) with no CurrentShield at all.
+            -- Reading only the HUD pair means the shield row never appears for
+            -- anyone on the ShieldHP path.
+            local shMax = statValue(char, "Shield") or 0
+            local shieldHp = statValue(char, "ShieldHP")
+            if shMax <= 0 and shieldHp and shieldHp > 0 then shMax = shieldHp end
+            if shMax > 0 then
+                local shCur = statValue(char, "CurrentShield") or shieldHp or 0
+                t.shRow.Visible = true
+                t.shFill.Size = UDim2.new(math.clamp(shCur / shMax, 0, 1), 0, 1, 0)
+                t.shFill.BackgroundColor3 = shCur > 0 and COL_SHIELD or COL_DEAD
+                t.shText.Text = ("%d/%d"):format(shCur, shMax)
+                t.gui.Size = UDim2.new(0, 150, 0, 42)
+            else
+                t.shRow.Visible = false
+                t.gui.Size = UDim2.new(0, 150, 0, 29)
+            end
+
+            -- Spawn protection is the single most useful thing to see at a
+            -- glance: a Safe player cannot be damaged at all (CheckSafe,
+            -- 0003.lua:4715) and is also the top reject reason in the engine's
+            -- own histogram. Colouring the name is cheaper to read than a
+            -- fourth row of text.
+            local safe = (statValue(char, "Safe") or 0) > 0
+            t.safe.Visible = safe
+            t.name.Text = plr.Name
+            t.dist.Text = ("%dm"):format((head.Position - origin).Magnitude)
+
+            if S.skeleton then
+                drawSkeleton(char, COL_BONE)
+            end
+        end
+    end
+
+    -- Hide the tail of the line pool that this frame did not use. Lines are
+    -- kept, not destroyed: player count swings every round and rebuilding
+    -- fourteen adornments per character per frame is the whole cost of this
+    -- feature if you get it wrong.
+    for i = S.used + 1, #S.lines do
+        S.lines[i].Visible = false
+    end
+end
+
+----------------------------------------------------------------------- api --
+
+function ESP.setOn(on)
+    on = on and true or false
+    if on == S.on then return S.on end
+    S.on = on
+
+    if not on then
+        if S.conn then pcall(function() S.conn:Disconnect() end) ; S.conn = nil end
+        for plr in pairs(S.tags) do dropTag(plr) end
+        S.tags = {}
+        if S.folder then pcall(function() S.folder:Destroy() end) ; S.folder = nil end
+        -- The pool indexes the destroyed folder's adornments; keeping it would
+        -- hand out dead instances whose .Visible writes go nowhere and the
+        -- skeleton would silently draw fewer lines every toggle.
+        S.lines, S.used = {}, 0
+        return false
+    end
+
+    ensureFolder()
+    S.lines, S.used = {}, 0
+    S.ticks, S.scanned, S.drawn, S.diag = 0, 0, 0, {}
+    S.conn = RunService.RenderStepped:Connect(function()
+        local ok, err = pcall(update)
+        if not ok then
+            -- One throw must not leave a dead connection spamming every frame.
+            warn("[CsEsp] update error, disabling — " .. tostring(err))
+            ESP.setOn(false)
+        end
+    end)
+    return true
+end
+
+function ESP.isOn() return S.on end
+
+function ESP.setSkeleton(on)
+    S.skeleton = on and true or false
+    if not S.skeleton then
+        for i = 1, #S.lines do S.lines[i].Visible = false end
+    end
+    return S.skeleton
+end
+function ESP.skeletonOn() return S.skeleton end
+
+function ESP.setMaxDist(n)
+    n = tonumber(n)
+    if n and n > 0 then S.maxDist = n end
+    return S.maxDist
+end
+function ESP.maxDist() return S.maxDist end
+
+function ESP.setTeamCheck(on)
+    S.teamCheck = on and true or false
+    return S.teamCheck
+end
+function ESP.teamCheck() return S.teamCheck end
+
+-- Reports what the LAST FRAME actually did, and says so when there has not
+-- been one yet. The first version counted S.tags immediately after setOn(true)
+-- — before update had ever run — so it printed "0 tagged" every single time and
+-- was read as "the overlay is finding nobody". A diagnostic that cannot
+-- distinguish "measured zero" from "not measured" is worse than none.
+function ESP.status()
+    if not S.on then
+        return ("esp off · skeleton %s · dist %d · teamcheck %s"):format(
+            S.skeleton and "on" or "off", S.maxDist, S.teamCheck and "on" or "off")
+    end
+    if S.ticks == 0 then
+        return "esp ON · no frame rendered yet — run `esp status` again in a second"
+    end
+    return ("esp ON · skeleton %s · dist %d · teamcheck %s · %d/%d drawn · %d bones · %d frames"):format(
+        S.skeleton and "on" or "off", S.maxDist, S.teamCheck and "on" or "off",
+        S.drawn, S.scanned, S.used, S.ticks)
+end
+
+-- Names every player the overlay skipped and why, in the same order and with
+-- the same predicates update() uses. This is the `why <player>` of the ESP.
+function ESP.why()
+    if not S.on then return { "esp is off" } end
+    if S.ticks == 0 then return { "no frame rendered yet" } end
+    local out = { ("scanned %d, drawn %d, bones %d, folder %s"):format(
+        S.scanned, S.drawn, S.used,
+        (S.folder and S.folder.Parent) and "live" or "MISSING") }
+    if #S.diag == 0 then
+        out[#out + 1] = "nobody skipped"
+    else
+        for _, line in ipairs(S.diag) do out[#out + 1] = line end
+    end
+    return out
+end
+
+function ESP.destroy()
+    S.alive = false
+    pcall(ESP.setOn, false)
+    sweepOrphans()
+    if getgenv().__CS_ESP == ESP then getgenv().__CS_ESP = nil end
+end
+
+Players.PlayerRemoving:Connect(function(plr) dropTag(plr) end)
+
+-- A respawn replaces the Character, so the Adornee a tag holds is a destroyed
+-- Head. update() re-points it every frame from the live Character, so nothing
+-- is needed here beyond not caching the character itself — noted because the
+-- obvious "cache char per player" optimisation breaks exactly this.
+
+getgenv().__CS_ESP = ESP
+return ESP
+]==]
+local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", "cs_esp.lua", }
+local ENGINE_BUILD = "2026-08-01 20:20:26"
 getgenv().__CS_BUILD = ENGINE_BUILD
 -- <<< ENGINE PAYLOAD END
 
@@ -11496,13 +12803,32 @@ task.defer(function()
     for _ = 1, 20 do
         local core = engine()
         if core and core.classes then
-            local n = 0
-            for name in pairs(core.classes()) do
+            local n, spawners = 0, {}
+            for name, cfg in pairs(core.classes()) do
                 core.setEnabled(name, true)
                 n = n + 1
+                -- A class with a castTrigger does more than steer: it SPAWNS a
+                -- body on cast (COWBOY High Noon on F). armAll used to skip
+                -- these so injecting could never put projectiles in the world by
+                -- itself -- but armAll is where classes are armed, and singling
+                -- one out made COWBOY the only class that did not come up with
+                -- the rest. It is armed like everything else now.
+                --
+                -- Still NAMED at boot, because the difference is real and worth
+                -- knowing you have live: `hs off` disarms everything and
+                -- persists, `hs COWBOY off` disarms just this one.
+                if cfg and cfg.castTrigger then
+                    spawners[#spawners + 1] = name
+                end
             end
             if n > 0 then
                 Log.info(("armAll: %d classes armed on load"):format(n))
+                if #spawners > 0 then
+                    table.sort(spawners)
+                    Log.warn(("armAll: %s armed and SPAWNS bodies on cast — live "
+                        .. "from this moment, lobby included. `hs %s off` to stop it")
+                        :format(table.concat(spawners, ", "), spawners[1]))
+                end
                 return
             end
         end
@@ -11532,22 +12858,10 @@ task.defer(function()
     Log.warn("cone: engine never loaded — visual debug not restored")
 end)
 
--- Restore High Noon. Same retry shape as the two above: the engine self-extracts
--- from the payload and setHighNoon may not exist yet at this point in the boot.
--- Its own block so it cannot be made conditional on either of them.
-task.defer(function()
-    if not S.highNoon then return end
-    for _ = 1, 20 do
-        local core = engine()
-        if core and core.setHighNoon then
-            core.setHighNoon(true)
-            Log.info("high noon: restored ON (fires on the COWBOY F cast)")
-            return
-        end
-        task.wait(0.25)
-    end
-    Log.warn("high noon: engine never loaded — not restored")
-end)
+-- There is no High Noon restore block. Arming is `hs COWBOY`, and class arming
+-- is deliberately never restored from disk (registerClass forces
+-- cfg.enabled = false), so a restore here would reintroduce exactly the
+-- comes-up-hot-on-inject behaviour that rule exists to prevent.
 
 task.defer(function()
     local raw = S.allyNames
@@ -12965,28 +14279,20 @@ end)
 -- would use to drag it back is the part that is off-screen. That failure cost a
 -- real session: the speed toggle read as "frozen" when it was simply below the
 -- edge. The clamp should prevent it; this is what you type when it does not.
--- COWBOY High Noon — forged aimed shot(s) with Burn.
+-- COWBOY High Noon — fire ONE forged round by hand, for testing.
 --
--- Keyed off the F PRESS rather than off a marker body, and that is forced
--- rather than preferred: COWBOY is not streamed in the dump and its body names
--- have never been captured, so there is nothing to match on. The ROCKETEER
--- cast-window trick needs a known VFX name; this class has none.
+-- No on|off any more. The behaviour is armed with its class (`hs COWBOY`) and
+-- fires off the `criticalimpact` marker, which is owner-stamped and therefore
+-- works for an assisted ally as well as for us -- neither of which a keypress
+-- or a global switch could do. This command exists only so the shot can be
+-- triggered without waiting for a cast.
 --
--- Consequence worth knowing: this fires when YOU press F, not when the game
--- confirms High Noon actually went off. If the ability is on cooldown or you are
--- stunned, the bullets still come out. Once `COWBOY bodies:` is captured from a
--- live arm, this should move to a marker so the two can never disagree.
-cmd("highnoon", "unproven", "highnoon [on|off] — COWBOY F: aimed hitscan shot + Burn (self + allies)", function(a)
+-- It refuses when COWBOY is not armed, deliberately: a manual fire that bypassed
+-- arming would be a second way to put bodies in the world, which is the thing
+-- being removed.
+cmd("highnoon", "unproven", "highnoon — fire one COWBOY High Noon round now (needs `hs COWBOY`)", function()
     local core = engine()
     if not core then return false, "engine not loaded" end
-    local w = a[1]
-    if w == "on" or w == "off" then
-        S.highNoon = (w == "on")
-        pcall(function() core.setHighNoon(S.highNoon) end)
-        return true, ("high noon: %s%s"):format(
-            S.highNoon and "ON" or "off",
-            S.highNoon and " — fires on the F cast, self + assisted allies; burn is UNPROVEN" or "")
-    end
     if type(core.fireHighNoon) ~= "function" then
         return false, "engine build has no fireHighNoon — rebuild"
     end
@@ -13014,6 +14320,62 @@ cmd("cone", "proven", "cone [on|off] — draw lock cone / candidates / bolt lock
     S.coneVis = now
     return true, ("cone debug %s%s"):format(now and "ON" or "off",
         now and " — RED=tracking (bolt→its target) · white=aim blue=cone edge green=close-lock yellow=lockable grey=refused" or "")
+end)
+
+-- ---- player overlay (ESP) ----
+--
+-- Reads only. Nothing here fires a remote, touches a character or changes a
+-- value: it draws Humanoid.Health/MaxHealth and Stats.CurrentShield/Stats.Shield
+-- with the game's own HUD colours (0603.lua:235-243, :180-186) plus a skeleton,
+-- all AlwaysOnTop so it renders through geometry.
+--
+-- Boots OFF and is not persisted. Unlike the combat toggles (CS_CONSTRAINTS.md
+-- §3) there is no reason to carry it across an inject, and a lobby full of
+-- name tags is exactly the kind of surface a person watching a stream notices.
+cmd("esp", "proven", "esp [on|off|skel|dist N|team|status|why] — names, health, shield, skeleton through walls", function(a)
+    -- Lazy-loaded from the embedded payload, same mechanism as the forge: the
+    -- overlay is dead weight in a session that never turns it on.
+    local function espApi()
+        if getgenv().__CS_ESP then return getgenv().__CS_ESP end
+        local body = ENGINE_PAYLOAD["cs_esp.lua"]
+        if not body or #body == 0 then
+            Log.warn("esp: payload missing cs_esp.lua — run tools/build_admin.sh")
+            return nil
+        end
+        local ok, err = pcall(function() loadstring(body)() end)
+        if not ok then Log.warn("esp: failed to load — " .. tostring(err)) end
+        return getgenv().__CS_ESP
+    end
+
+    local api = espApi()
+    if not api then return false, "esp module not loaded — rebuild with tools/build_admin.sh" end
+
+    local sub = a[1]
+    if sub == "status" then return true, api.status() end
+    if sub == "why" then
+        for _, line in ipairs(api.why()) do Log.info("  " .. line) end
+        return true, api.status()
+    end
+    if sub == "skel" or sub == "skeleton" then
+        return true, "skeleton " .. (api.setSkeleton(not api.skeletonOn()) and "on" or "off")
+    end
+    if sub == "dist" then
+        if not tonumber(a[2]) then return false, "esp dist <studs>" end
+        return true, ("esp range %d studs"):format(api.setMaxDist(a[2]))
+    end
+    if sub == "team" or sub == "teamcheck" then
+        return true, "teamcheck " .. (api.setTeamCheck(not api.teamCheck()) and "on — allies hidden" or "off")
+    end
+
+    local want
+    if sub == nil then want = not api.isOn()
+    else want = (sub == "on" or sub == "1" or sub == "true") end
+    api.setOn(want)
+    -- Wait a frame before reporting. status() counts what the last UPDATE did,
+    -- and enabling does not run one, so reporting immediately always printed
+    -- "0 tagged" no matter what the overlay was doing.
+    if want then task.wait() end
+    return true, api.status()
 end)
 
 -- ---- engine ----
@@ -13155,6 +14517,15 @@ end)
 -- Until it confirms, the engine stays on the replicating path, which is the
 -- one we already know works. A wrong guess here costs a duplicate bolt on
 -- other screens; guessing the other way would cost every shot.
+cmd("why", "proven", "why <player> — why that person is or is not lockable, right now", function(a)
+    local core = engine()
+    if not core then return false, "engine not loaded" end
+    if not a[1] then return false, "why <player>" end
+    local p, err = findPlayer(a[1])
+    if not p then return false, err end
+    return true, core.explainTarget(p)
+end)
+
 cmd("probe2", "unproven", "probe2 [player] — test replicate=false damage", function(a)
     local core = engine()
     if not core then return false, "engine not loaded" end
@@ -14220,6 +15591,9 @@ local ROWS = {
     -- pill is a readout of the engine rather than a second opinion about it.
     { key = "overrideOn", label = "override cone", bind = "override",
       risk = "unproven", tag = "override" },
+    -- No High Noon row. It is not a toggle -- it is part of COWBOY, armed with
+    -- the class by `hs COWBOY`. A row here would be a second arming surface for
+    -- one behaviour, which is the drift bug this codebase keeps paying for.
 }
 
 local function cycleCd()
@@ -16368,6 +17742,12 @@ function S.destroy()
     -- steering after the panel is gone, with no UI left to turn it off.
     local core = getgenv().__CS_CORE
     if core and type(core.destroy) == "function" then pcall(core.destroy) end
+    -- The overlay is a THIRD getgenv module with its own RenderStepped
+    -- connection and its own folder in CoreGui — outside our instance tree, so
+    -- nothing else collects it. Same rule as the engine: unloading the panel
+    -- must leave nothing drawing.
+    local esp = getgenv().__CS_ESP
+    if esp and type(esp.destroy) == "function" then pcall(esp.destroy) end
     -- Belt-and-braces: destroyPanels ran at the top, but a ScreenGui created
     -- between then and now (a racing buildUi) would still be caught here.
     pcall(destroyPanels)
@@ -16497,13 +17877,43 @@ end)
 -- the running v2 back to a v1 build on the next v1 rebuild.
 local HOT_SRC = "cs_adminv2.lua"
 local HOT_POLL_SEC = 3
-local HOT_PORTABLE = true  -- dist build: no repo to watch
+
+-- REMOTE SOURCE. nil in every local build -- the workspace file is the deploy
+-- target here, and reading it is both instant and free.
+--
+-- tools/build_portable.sh rewrites this to a URL. That build runs on somebody
+-- else's machine where `cs_adminv2.lua` is either absent or an unrelated file
+-- from another script pack, so the local watcher was compiled out entirely and
+-- the portable became a one-way door: every fix meant sending a new file and
+-- asking them to re-inject, mid-match.
+--
+-- With a URL it polls the same address it was loaded from, so a rebuild that is
+-- published reaches a player who is already in a round.
+--
+-- Three things follow from it being a network read, and all three are handled
+-- below rather than assumed away:
+--   * it can fail (offline, rate limit) -- a failed poll must be a no-op, never
+--     a teardown;
+--   * it is slow relative to a file read, so the interval is much longer;
+--   * raw.githubusercontent caches for ~5 minutes, so "published" and "live"
+--     are not the same instant and no amount of polling changes that.
+local HOT_URL = "https://raw.githubusercontent.com/xReset/cs-dist/main/cs_portable.lua"  -- dist build: poll the published copy
+local HOT_URL_POLL_SEC = 60
 
 G.__CS_ADMIN_GEN = (G.__CS_ADMIN_GEN or 0) + 1
 local myGen = G.__CS_ADMIN_GEN
 S.hotReload = true
 
 local function hotReadSource()
+    -- Remote build: fetch from where it was published. pcall'd because HttpGet
+    -- THROWS on a network failure rather than returning nil, and an unguarded
+    -- throw here kills the polling task -- which would disable reload for the
+    -- session on the first blip, exactly the silent failure this is meant to end.
+    if HOT_URL then
+        local ok, body = pcall(function() return game:HttpGet(HOT_URL) end)
+        if ok and type(body) == "string" and #body > 0 then return body end
+        return nil, "cannot fetch " .. HOT_URL .. " — " .. tostring(body)
+    end
     if not readfile then return nil, "readfile unavailable in this executor" end
     -- One source, no alternates. See HOT_SRC.
     local ok, body = pcall(readfile, HOT_SRC)
@@ -16536,7 +17946,16 @@ local function hotApply(body, why)
 end
 
 task.spawn(function()
-    if HOT_PORTABLE then S.hotReload = false return end
+    -- cs_boot owns reload when it is present. It polls the same file from
+    -- OUTSIDE this script, so it survives a build that throws on load -- which
+    -- this watcher cannot, because a copy that throws never reaches this line
+    -- and reload dies for the session. Two loops on one file would double every
+    -- reload, so exactly one of us runs and cs_boot wins.
+    if G.__CS_BOOT_RELOAD then
+        S.hotReload = false
+        Log.info("hot reload: cs_boot owns it — this watcher stands down")
+        return
+    end
     local last = hotReadSource()
     if not last then
         -- WARN, not INFO. When this fires, every future rebuild silently fails to
@@ -16547,9 +17966,43 @@ task.spawn(function()
         return
     end
     Log.info(("hot reload armed — polling %s every %ds (gen %d)")
-        :format(HOT_SRC, HOT_POLL_SEC, myGen))
+        :format(HOT_URL or HOT_SRC, HOT_URL and HOT_URL_POLL_SEC or HOT_POLL_SEC,
+            myGen))
+
+    -- RECONCILE ON ARM. The watcher fires on CHANGE, and its baseline is the
+    -- file, not the text actually running -- so injecting a stale copy while a
+    -- newer build already sits on disk arms a watcher that compares the new file
+    -- against itself, concludes nothing changed, and waits forever. Silently.
+    --
+    -- Measured, 2026-08-01: a rejoin at 19:47 re-injected an admin whose engine
+    -- was stamped 05:02:22 while the workspace file was 19:46:47. Hot reload
+    -- armed normally and never fired. Two sessions of JESTER tuning were then
+    -- read off an engine that did not contain any of it, and the tuning was
+    -- reported as ineffective. This is HANDOFF_2026-08-01 §1's trap through a
+    -- different door -- the running build and the file on disk disagreeing with
+    -- nothing in the log saying so.
+    --
+    -- The build stamp is the one fact that settles it, which is exactly what the
+    -- entry docs say to trust. Compare it, and if it differs, apply immediately
+    -- rather than waiting for a change that already happened.
+    do
+        local fileBuild = last:match('ENGINE_BUILD%s*=%s*"([^"]+)"')
+        local runBuild  = G.__CS_BUILD
+        if fileBuild and runBuild and fileBuild ~= runBuild then
+            Log.warn(("hot reload: running build %s but %s on disk is %s — "
+                .. "applying it now")
+                :format(tostring(runBuild), HOT_SRC, fileBuild))
+            if hotApply(last, "stale inject") then return end
+        elseif fileBuild and not runBuild then
+            -- No stamp in the running copy at all: too old to compare, and that
+            -- is itself the signal. Named rather than assumed either way.
+            Log.warn("hot reload: the running copy has no build stamp — it "
+                .. "predates the stamp itself. Re-inject " .. HOT_SRC)
+        end
+    end
+
     while true do
-        task.wait(HOT_POLL_SEC)
+        task.wait(HOT_URL and HOT_URL_POLL_SEC or HOT_POLL_SEC)
         -- Superseded by a newer load, or the panel is gone: stop polling.
         if G.__CS_ADMIN_GEN ~= myGen then return end
         if not S.alive then return end
@@ -16563,7 +18016,7 @@ task.spawn(function()
     end
 end)
 
-cmd("reload", "proven", "reload [on|off] — re-run the script from disk", function(a)
+cmd("reload", "proven", "reload [on|off] — re-fetch and re-run this script", function(a)
     local sub = (a[1] or ""):lower()
     if sub == "off" then
         S.hotReload = false
@@ -16577,5 +18030,6 @@ cmd("reload", "proven", "reload [on|off] — re-run the script from disk", funct
     if not body then return false, err end
     local ok, why = hotApply(body, "manual")
     if not ok then return false, why end
-    return true, "reloading from disk"
+    return true, HOT_URL and "re-fetching from the published build"
+        or "reloading from disk"
 end)

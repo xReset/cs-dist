@@ -1096,6 +1096,42 @@ local T = {
     predictiveLead = true,
     legitMaxLeadSec = 0.30,
 
+    -- ---------------------------------------------------------------------
+    -- UNIVERSAL FLIGHT LAW — how the bolt gets onto its intercept.
+    --
+    -- The five tells above all soften CURVATURE; they cannot remove it, because
+    -- classic guidance keeps the player's actual aim and then curves the bolt
+    -- toward the target mid-flight. Any curve is the tell. This replaces the
+    -- curve with a SPAWN SNAP: on the first steered frame -- before the eye can
+    -- register the launch direction -- the heading jumps most or all of the way
+    -- to the ballistic intercept, and then the bolt flies (nearly) straight. A
+    -- straight bolt to a leading intercept reads as a good prediction shot, and
+    -- when the target jukes it flies straight past, exactly like a real missed
+    -- lead. Silent aim, not heatseek.
+    --
+    --   "classicPN" — original behaviour: keep the aim, curve via PN mid-flight.
+    --   "hybrid"    — DEFAULT. Snap `snapFraction` of the way to the intercept at
+    --                 launch, then allow a SMALL PN residual (hybridResidualDevDeg)
+    --                 to track a target that changes course. Straight-looking,
+    --                 still adapts.
+    --   "silent"    — snap fully to the intercept and never correct again. Zero
+    --                 curve, cleanest miss on a juke, lowest hit rate on movers.
+    --
+    -- Per-class override: `cfg.flight.flightLaw = "classicPN"` opts one class back
+    -- to the old law if it regresses. See Core.flightLawFor.
+    flightLaw = "hybrid",
+
+    -- Fraction of the gap between the player's aim and the full intercept applied
+    -- in the hybrid spawn snap. 1.0 would be identical to "silent". The remainder
+    -- is left to the player's own aim and to the PN residual.
+    snapFraction = 0.9,
+
+    -- Deviation budget (deg) for the PN residual AFTER a hybrid snap, measured
+    -- from the snapped heading -- NOT the player's original aim, which the snap
+    -- already left behind. Small on purpose: the snap did the aiming, the residual
+    -- only chases a target that moves. Caps whatever legitBudget would allow.
+    hybridResidualDevDeg = 8,
+
     -- Master switch. false = the old behaviour (immediate full-authority
     -- steering, no deviation budget). Kept so the difference can be measured
     -- rather than argued about.
@@ -5499,6 +5535,24 @@ end
 -- entire point of routing ally echoes through this function instead of a second
 -- copy of it -- the weld guard, the mover restore, the turn clamp and the
 -- FLIGHT telemetry all apply to ally bolts for free.
+-- Which flight law governs this class. Per-class `cfg.flight.flightLaw` wins;
+-- otherwise the global T.flightLaw. Unknown/absent falls back to the safe old
+-- law so a typo can never silently disable guidance for a class.
+function Core.flightLawFor(cfg)
+    local f = cfg and cfg.flight
+    -- Boomerang bodies are RECLAIMED by the game and flown home. The spawn snap
+    -- redirects a body's launch velocity onto the intercept and holds a mover on
+    -- it -- which fights the return: the ball sails off on our heading and
+    -- expires "gone" instead of coming back. MEASURED on JESTER attack (Card
+    -- Trick) 2026-08-02: 10/16 flights went "gone" at lifetime, only 4 returned,
+    -- all under the snap. These stay on the old mid-flight law, which frees the
+    -- body on reversal (see the reversal guard) and lets the game's return run.
+    if f and f.stopWhenReturningToOwner then return "classicPN" end
+    local law = (f and f.flightLaw) or T.flightLaw or "classicPN"
+    if law ~= "hybrid" and law ~= "silent" then return "classicPN" end
+    return law
+end
+
 local function steer(proj, cfg, ctx)
     markTracked(proj)
 
@@ -5707,6 +5761,63 @@ local function steer(proj, cfg, ctx)
     local shortEngage = engageDist and engageDist < 12
     local budget = legitBudget(projSpeed(proj), projRange(proj), engageDist)
     if rec.tl then rec.tl.budget = budget end
+
+    -- ── UNIVERSAL FLIGHT LAW ────────────────────────────────────────────
+    -- Silent-aim spawn snap. See T.flightLaw. classicPN skips all of this and
+    -- behaves exactly as it did before this block existed.
+    local flightLaw = Core.flightLawFor(cfg)
+    -- Effective IN-FLIGHT deviation cap. classicPN keeps the class's full budget;
+    -- hybrid clamps it to the small residual (the snap already did the aiming);
+    -- silent forbids any correction at all. This is the ONLY deviation number the
+    -- freeze reads below -- the lock-time cone still uses lockDevFor unchanged.
+    local devCap = Core.lockDevFor(cfg, proj)
+    if flightLaw == "hybrid" then
+        devCap = math.min(devCap, T.hybridResidualDevDeg or 8)
+    elseif flightLaw == "silent" then
+        devCap = 0
+    end
+    if rec.tl then rec.tl.devBudget = devCap end
+    if flightLaw ~= "classicPN" and Core.legitNow() then
+        -- The snap IS the launch, so there is no fly-straight muzzle delay to sit
+        -- through: that delay hides the ONSET of a curve, and there is no curve.
+        budget.muzzle = 0
+        local th0 = tgt:FindFirstChild("HumanoidRootPart")
+        if th0 and th0.Parent then
+            local sp0 = projSpeed(proj)
+            local aim0 = leadPoint(th0, proj.Position, sp0)
+            local want = aim0 - proj.Position
+            -- Heading the bolt is actually travelling right now (physics first,
+            -- then the spawn look) -- the direction the snap turns AWAY from.
+            local cur0 = initLook
+            local alv0 = proj.AssemblyLinearVelocity
+            if alv0 and alv0.Magnitude > 1 then cur0 = alv0.Unit end
+            if want.Magnitude > 1e-3 and cur0 and cur0.Magnitude > 1e-6 then
+                local frac = (flightLaw == "silent") and 1 or (T.snapFraction or 0.9)
+                local snapped = cur0.Unit:Lerp(want.Unit, frac)
+                if snapped.Magnitude > 1e-6 then
+                    snapped = snapped.Unit
+                    -- Write the heading into the mover immediately: frame 0 leaves
+                    -- on the intercept. VELOCITY ONLY -- the game owns the part's
+                    -- orientation (0704.lua:716 pins it), so there is no crab to
+                    -- correct and no CFrame to fight.
+                    ensureMover(proj, sp0, snapped, rec)
+                    -- Seed launchDir to the SNAPPED heading so the deviation budget
+                    -- and the reversal guard measure the residual from here. Left
+                    -- nil, the loop would set launchDir to the pre-snap aim and read
+                    -- the snap itself as one enormous deviation -> instant freeze.
+                    launchDir = snapped
+                    if rec.tl then
+                        rec.tl.launchDir = snapped
+                        rec.tl.snapped = true
+                    end
+                    logx("flight", ("#%s snap %s law=%s frac=%.2f")
+                        :format(tostring(rec.tl and rec.tl.castId or "?"),
+                            proj.Name, flightLaw, frac))
+                end
+            end
+        end
+    end
+    -- ────────────────────────────────────────────────────────────────────
 
     local outcome = "flight end"
     while S.alive and proj and proj.Parent and os.clock() < stop do
@@ -6078,8 +6189,11 @@ local function steer(proj, cfg, ctx)
                         -- WRITTEN to the budget, every frame. The reserve was
                         -- guarding against an overshoot that the clamp prevents
                         -- and the telemetry was only appearing to show.
-                        if Core.legitNow()
-                            and dev >= Core.lockDevFor(cfg, proj) then
+                        -- devCap, not lockDevFor: under hybrid this is the small
+                        -- PN residual and under silent it is 0 (freeze on the
+                        -- first residual frame -> the bolt never curves). classicPN
+                        -- sets devCap = lockDevFor, so this is unchanged for it.
+                        if Core.legitNow() and dev >= devCap then
                             steerFrozen = true
                             freezeWhy = ("dev %.0f°"):format(dev)
                             return
@@ -7853,6 +7967,27 @@ function Core.tune(key, value)
             :format(key, tostring(prev), tostring(value), #found)
     end
     return true
+end
+
+-- Live flight-law switch (see T.flightLaw). Global with Core.setFlightLaw(mode),
+-- or per-class with Core.setFlightLaw(mode, "CLASSNAME"). Validated so a typo
+-- cannot silently disable guidance for a class. Takes effect on the NEXT cast --
+-- bolts already in flight keep the law they launched under, which is correct.
+function Core.setFlightLaw(mode, className)
+    mode = tostring(mode or ""):lower()
+    if mode == "classicpn" then mode = "classicPN" end
+    if mode ~= "hybrid" and mode ~= "silent" and mode ~= "classicPN" then
+        return false, "mode must be: hybrid | silent | classicPN"
+    end
+    if className and className ~= "" then
+        local key = tostring(className):upper()
+        local cfg = S.classes[key]
+        if not cfg then return false, "unknown class " .. key end
+        cfg.flight.flightLaw = mode
+        return true, ("%s flightLaw -> %s"):format(key, mode)
+    end
+    T.flightLaw = mode
+    return true, ("global flightLaw -> %s"):format(mode)
 end
 
 --------------------------------------------------------------------------
@@ -10690,6 +10825,53 @@ Core.registerClass("CONTROLLER", {
     },
 })
 
+--------------------------------------------------------------------------
+-- GLADIATOR — E ONLY, as instructed.
+--
+-- Kit (0567.lua:1092):
+--   ATK Trident Stab        -- a forward JAB. Melee, reaches forward, no
+--                              travelling body.                          DENIED
+--   AB1 Brass Leap          -- Q. Leap + downward stab AoE on landing. No
+--                              outgoing bolt.                            DENIED
+--   AB2 Bola Toss           -- E. "Throw a bola forwards", 5 dmg + Cripple
+--                              (2s). THE ONLY THROWN PROJECTILE IN THE KIT. ALLOWED
+--   CRT Challenger's Approach -- F. A dash that spawns the arena and applies
+--       / Fierce Guard         Challenge to both players. A dash + a guard,
+--                              not a bolt -- and Challenge is itself a
+--                              hittability gate (0704.lua:351).          DENIED
+--
+-- Slot map (0003.lua:37): Ability2 = "e". Same mapping FIGHTER, FROST, JAVELIN,
+-- BLASTER and PHANTOM are keyed on, so the E body follows the `ability2`
+-- convention.
+--
+-- UNVERIFIED — GLADIATOR is ABSENT from the projectile census
+-- (classes_projectiles.txt: "nobody in this round played it"), so its body
+-- names are NOT confirmed from the dump. `ability2` is the convention, not a
+-- measurement. This is exactly how GHOST (`ability2bomb`), SCOUT (`critical1`)
+-- and PHANTOM (`ability2alt`) stayed broken for months. CONFIRM before trusting:
+-- arm GLADIATOR, throw one Bola, and read the `GLADIATOR bodies:` arm-time audit
+-- line (or `claim X [GLADIATOR]`) in cs_core.log. If the bola is named for
+-- itself (e.g. `bola`, `ability2bola`) rather than `ability2`, add that exact
+-- name here -- the current allow will simply claim nothing until then, which is
+-- a safe failure the reject histogram reports as `not GLADIATOR bolt (X)`.
+--
+-- Ally support needs nothing extra: registering the class gives both self
+-- heatseek and the ally echo, and allyAllow/allyDeny fall through to allow/deny.
+--------------------------------------------------------------------------
+Core.registerClass("GLADIATOR", {
+    aliases = { "GLADIATOR" },   -- 0567.lua:1092-1093 (CLASS field)
+    accept  = Core.gates.classProvenance,
+    allow   = { "ability2" },    -- E Bola Toss (0567.lua:1107) — UNVERIFIED (class unstreamed)
+    deny    = {
+        "attack",    -- ATK Trident Stab — forward jab, melee (0567.lua:1097)
+        "ability1",  -- Q Brass Leap — leap + slam, no bolt (0567.lua:1102)
+        "ability3",  -- R slot — kit has no AB3; belt-and-braces
+        "critical",  -- F Challenger's Approach — dash + arena (0567.lua:1112)
+        "arena", "challenge", "guard", "leap", "trident",
+        "eff", "visual", "sheathe",
+    },
+})
+
 -- Audits and logs the registration. Replaces a bare count, which could not tell
 -- you that a class had no allow list or that a deny string was eating one of its
 -- own allow entries -- both of which fail silently in play.
@@ -12701,7 +12883,7 @@ getgenv().__CS_ESP = ESP
 return ESP
 ]==]
 local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", "cs_esp.lua", }
-local ENGINE_BUILD = "2026-08-02 02:20:14"
+local ENGINE_BUILD = "2026-08-02 03:28:06"
 getgenv().__CS_BUILD = ENGINE_BUILD
 -- <<< ENGINE PAYLOAD END
 

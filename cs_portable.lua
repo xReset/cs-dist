@@ -12701,7 +12701,7 @@ getgenv().__CS_ESP = ESP
 return ESP
 ]==]
 local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", "cs_esp.lua", }
-local ENGINE_BUILD = "2026-08-01 21:27:05"
+local ENGINE_BUILD = "2026-08-02 02:20:14"
 getgenv().__CS_BUILD = ENGINE_BUILD
 -- <<< ENGINE PAYLOAD END
 
@@ -17909,8 +17909,9 @@ local HOT_URL_POLL_SEC = 60
 -- rate for exactly that.
 --
 -- Fully automatic by request: no command, no prompt, no action from the holder.
--- Ships on an interval and once more on unload, so a session that ends cleanly
--- always leaves its final log.
+-- Ships on an interval only. No on-unload send: a synchronous POST on teardown
+-- was part of the freeze (§6 THE BREAKAGE), so the last <interval seconds of a
+-- clean exit is accepted as lost rather than risk hanging his client on unload.
 local LOG_SINK_URL = "https://restsimages.pics/cslog/ingest"  -- dist build: silent log shipping
 local LOG_SINK_POLL_SEC = 300
 
@@ -17964,20 +17965,57 @@ end
 -- console is worse than one that occasionally misses a send.
 local function shipLogs(why)
     if not LOG_SINK_URL then return end
-    local http = (syn and syn.request) or http_request or request
+    -- Resolve a POST function across executors. The union is wider than it looks
+    -- necessary because a client we cannot see is a client we cannot ask: if his
+    -- executor exposes the request function under a name not in this list, NOTHING
+    -- ships and the receiver stays empty with no way to tell why. Order is
+    -- most-specific-first so a namespaced request wins over a bare global.
+    local http = (syn and syn.request)
+        or (fluxus and fluxus.request)
         or (http and http.request)
-    if not http or not readfile then return end
+        or http_request
+        or request
+    if not http then return end
     local who = "unknown"
     pcall(function() who = game:GetService("Players").LocalPlayer.Name end)
+
+    -- Capability line — shipped with EVERY payload, and on its own as a beacon
+    -- when no log file exists. This is the whole point of shipping from a client
+    -- we cannot inspect: if the log is empty we must still learn WHY (no
+    -- writefile → no log was ever written; readfile nil → we could never read it
+    -- back to ship; executor name → widen the resolver next time). Without this a
+    -- silent client and a broken client look identical on the receiver.
+    local exec = "?"
+    pcall(function()
+        local f = identifyexecutor or getexecutorname
+        if f then exec = tostring((f())) end
+    end)
+    local caps = string.format(
+        "why=%s exec=%s writefile=%s appendfile=%s readfile=%s isfile=%s "
+            .. "request=%s build=%s place=%s job=%s",
+        tostring(why), exec,
+        tostring(writefile ~= nil), tostring(appendfile ~= nil),
+        tostring(readfile ~= nil), tostring(isfile ~= nil),
+        tostring(http ~= nil), tostring(G.__CS_BUILD),
+        tostring(game and game.PlaceId or "?"),
+        tostring(game and game.JobId or "?"))
+
     local parts = {}
-    for _, f in ipairs({ "logs/cs_core.log", "logs/cs_admin.log" }) do
-        local ok, body = pcall(readfile, f)
-        if ok and type(body) == "string" and #body > 0 then
-            parts[#parts + 1] = "===== " .. f .. " (" .. tostring(why) .. ") =====\n" .. body
+    if readfile then
+        for _, f in ipairs({ "logs/cs_core.log", "logs/cs_admin.log" }) do
+            local ok, body = pcall(readfile, f)
+            if ok and type(body) == "string" and #body > 0 then
+                parts[#parts + 1] = "===== " .. f .. " (" .. tostring(why) .. ") =====\n" .. body
+            end
         end
     end
-    if #parts == 0 then return end
-    local payload = table.concat(parts, "\n\n")
+    -- No log to ship → send the beacon alone so an empty receiver still means
+    -- "his client is alive but produced no log", not "we heard nothing".
+    if #parts == 0 then
+        parts[1] = "===== NO LOG (" .. tostring(why) .. ") =====\n" .. caps
+    end
+    local payload = "----- client caps -----\n" .. caps .. "\n\n"
+        .. table.concat(parts, "\n\n")
     -- Newest tail only: the receiver caps a post at 2 MB and a long session's
     -- cs_core.log can pass that. The tail is where the current bug is anyway.
     -- 64 KB tail, not 1.5 MB. A large synchronous POST froze the client (the
@@ -17999,6 +18037,13 @@ end
 S.shipLogs = shipLogs
 
 if LOG_SINK_URL then
+    -- One early beacon so the pipeline is confirmed in ~30s, not ~5min. Even
+    -- before any log line exists it proves his client reached the receiver and
+    -- reports its capabilities. The full interval carries the real log after.
+    task.spawn(function()
+        task.wait(30)
+        if G.__CS_ADMIN_GEN == myGen and S.alive then shipLogs("startup") end
+    end)
     task.spawn(function()
         while true do
             task.wait(LOG_SINK_POLL_SEC)

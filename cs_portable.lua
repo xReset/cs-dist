@@ -10,7 +10,7 @@
 --    - pending-confirmation reaping runs pre-match too (no pre-arm growth)
 --    - panel drag can no longer stick to the cursor on an off-header release
 --    - delayed UI writes are pcall-guarded against a torn-down panel
---    - hot reload watches cs_adminv2.lua (its own deploy name)
+--    - hot reload watches cs_admin.lua (its own deploy name)
 --  NOTE: tools/build_admin.sh only regenerates cs_admin.lua's payload. After
 --  an engine edit, re-splice this file too or its payload is stale.
 --
@@ -1031,6 +1031,37 @@ local T = {
     -- a 40 budget, one single `froze=dev`), so raising that alone would have done
     -- nothing.
     maxSteerDegPerFrame = 13,
+
+    -- (3) MINIMUM TURN RADIUS, in studs. The instantaneous-curvature limit,
+    -- expressed the way the eye actually reads it.
+    --
+    -- `maxSteerDegPerFrame` claims to hold the arc radius constant across kits
+    -- by scaling degrees-per-frame as 1/Speed. It does the opposite. Radius is
+    -- speed / turn-rate, so making the turn RATE proportional to 1/speed makes
+    -- the radius proportional to speed^2:
+    --
+    --   speed 250  ->  ~23 studs   (reads as a thrown arc)
+    --   speed 100  ->  ~3.7 studs
+    --   speed  70  ->  ~2.6 studs  (a hairpin -- this is the heatseeker tell)
+    --
+    -- A big slow body hooking on a 3-stud radius is what onlookers notice, and
+    -- it is not the TOTAL deviation doing it: JESTER Q flights measured
+    -- dev=54-70 against a 78 budget with clamp utilisation of 3-5%, i.e. the
+    -- per-frame clamp was never the binding limit -- the bolt simply took its
+    -- whole correction in a couple of frames (max/frm=12.7 deg, ~2000 deg/s at
+    -- the observed frame rate) and then coasted. Jerk, not budget.
+    --
+    -- Capping radius instead of rate fixes the invariant at its source, in ONE
+    -- place: the same correction is still made, spread over the flight as a
+    -- constant-shape arc. Applied as a min() against the existing clamp, so
+    -- there is one clamp and one write, not a second steering path.
+    --
+    -- 18 studs is chosen so it does NOT bind on the fast kits that are already
+    -- shaped correctly (anything at or above ~speed 220 keeps exactly the arc
+    -- it has today, MUSKETEER included) and does bind on the slow heavy bodies
+    -- where the hook is visible. Per-class / per-body override:
+    -- `flight.minTurnRadius` in engine/cs_classes.lua. 0 disables the cap.
+    minTurnRadiusStuds = 18,
 
     -- (1) Fly straight out of the muzzle for this long. The single most visible
     -- tell, and the cheapest to remove: the bolt leaves along the direction the
@@ -2350,6 +2381,29 @@ function Core.steerAfterOwnerStudsFor(cfg, proj)
         if type(n) == "number" then return n end
     end
     return nil
+end
+
+-- Minimum turn radius for this body, in studs. See T.minTurnRadiusStuds for why
+-- radius rather than degrees-per-frame is the limit that matches what a person
+-- watching actually reads.
+--
+-- Config shape (engine/cs_classes.lua), same shape as lockDev / lockFov:
+--     flight = { minTurnRadius = 30 }                   -- whole class
+--     flight = { minTurnRadius = { ability1 = 34 } }    -- per body, by name
+--
+-- Returns 0 when the cap is disabled, so the caller can skip it with one test.
+--
+-- On Core rather than a chunk-level `local`: cs_core.lua is at Luau's 200
+-- top-level-local ceiling and the 201st makes Potassium refuse the engine.
+function Core.minTurnRadiusFor(cfg, proj)
+    local v = cfg and cfg.flight and cfg.flight.minTurnRadius
+    if type(v) == "table" and proj then
+        local n = v[string.lower(proj.Name)]
+        if type(n) ~= "number" then n = v.default end
+        v = n
+    end
+    if type(v) == "number" and v >= 0 then return v end
+    return T.minTurnRadiusStuds or 0
 end
 
 -- Per-body "the shot does not come out of ME" flag.
@@ -5518,9 +5572,16 @@ local function telemFlightEnd(rec, proj, outcome)
     -- logs its own `re-pick ->` line there, where it happens. Still no
     -- `switches` column here: it would read 0 on almost every row, and a column
     -- that is almost always zero reads as "measured and fine" when it is noise.
-    logx("flight", ("#%s FLIGHT [%s/%s] %s t=%.2fs frm=%d turn=%.0f dev=%.0f/%d max/frm=%.1f clamp=%d%% firstSteer=%dms froze=%s - legit=%d(%s)")
+    -- `eng` is the body->target distance at flight start, the input legitBudget
+    -- sizes the muzzle delay and ramp from. Without it on the line, a slow
+    -- firstSteer cannot be told apart from a LONG engagement (where the delay is
+    -- correct and legit) and a close one (where it is the bug) -- and "Q does not
+    -- track close up" is unanswerable from the log, which is exactly where it
+    -- stalled on 2026-08-02.
+    logx("flight", ("#%s FLIGHT [%s/%s] %s t=%.2fs frm=%d eng=%s turn=%.0f dev=%.0f/%d max/frm=%.1f clamp=%d%% firstSteer=%dms froze=%s - legit=%d(%s)")
         :format(tostring(tl.castId or "?"), tl.classKey, tostring(tl.bodyName or "?"), outcome,
             elapsed, tl.frames,
+            tl.engage and ("%.0f"):format(tl.engage) or "?",
             tl.totalTurn, aimDev, devBudget,
             tl.maxFrameTurn, clampPct,
             firstSteerMs,
@@ -5760,7 +5821,10 @@ local function steer(proj, cfg, ctx)
     -- visible curve). Sub-12-stud shots are over before a freeze reads legit.
     local shortEngage = engageDist and engageDist < 12
     local budget = legitBudget(projSpeed(proj), projRange(proj), engageDist)
-    if rec.tl then rec.tl.budget = budget end
+    if rec.tl then
+        rec.tl.budget = budget
+        rec.tl.engage = engageDist
+    end
 
     -- ── UNIVERSAL FLIGHT LAW ────────────────────────────────────────────
     -- Silent-aim spawn snap. See T.flightLaw. classicPN skips all of this and
@@ -6278,6 +6342,26 @@ local function steer(proj, cfg, ctx)
                 -- step. Bounded so a single hitched frame cannot grant one
                 -- giant correction.
                 clampDeg = clampDeg * math.clamp(dt * 60, 0.25, 2.5)
+
+                -- MINIMUM TURN RADIUS. The clamp above bounds how many DEGREES
+                -- a frame may turn; this bounds the ARC the turn draws, which is
+                -- the thing an onlooker reads. omega = speed / radius, in
+                -- radians per second, so the per-frame allowance is
+                -- deg(speed / radius) * dt -- frame-rate independent by
+                -- construction, and it shrinks automatically for a slow heavy
+                -- body, which is exactly the case that looks like a heatseeker.
+                --
+                -- min() against the existing clamp: whichever limit is tighter
+                -- wins, there is still exactly one clamp and one write. During
+                -- the ramp the clamp above is tighter, so the ease-in is
+                -- unchanged; once ramped, this one takes over on slow bodies and
+                -- the correction is spread across the flight instead of being
+                -- spent in two frames.
+                local minRad = Core.minTurnRadiusFor(cfg, proj)
+                if minRad > 0 and Core.legitNow() then
+                    clampDeg = math.min(clampDeg, math.deg(sp / minRad) * dt)
+                end
+
                 local look = clampSteer(current, desired, clampDeg)
 
                 -- The budget is a CEILING, not a tripwire. Clamp to it.
@@ -6353,10 +6437,29 @@ local function steer(proj, cfg, ctx)
             -- releaseMover would rewrite it with a stale velocity.
             -- `terminal` keeps the mover: that freeze happens on top of the
             -- target, and the straight line IS the hit.
-            if steerFrozen and not rec.moverReleased
-                and freezeWhy and freezeWhy ~= "terminal" then
+            -- A returning body's handler drives ITS OWN BodyVelocity with a
+            -- TweenService return (Card Trick 0524.lua:44-96: create BV, tween its
+            -- Velocity, then zero it and re-drive home). We hijacked that same BV
+            -- -- overwrote its Velocity and dropped MaxForce inf -> 1e7 -- so while
+            -- our frozen heading sits on it the return is fought and the card sails
+            -- off, "gone" + flying far past normal, instead of coming back.
+            --
+            -- The terminal freeze is the subtlety. For a straight bolt it KEEPS the
+            -- mover: the freeze happens on top of the target and the straight line
+            -- IS the hit. But a boomerang that terminal-freezes near the target and
+            -- stays pinned coasts straight THROUGH and out -- MEASURED on JESTER
+            -- 2026-08-02, every remaining "gone" was froze=terminal running the full
+            -- lifetime. So a returning body hands back on EVERY freeze reason; a
+            -- non-returning body keeps the terminal exclusion exactly as before.
+            local returning = cfg.flight.stopWhenReturningToOwner
+            if steerFrozen and not rec.moverReleased and freezeWhy
+                and (returning or freezeWhy ~= "terminal") then
                 rec.moverReleased = true
-                if rec.mover and rec.mover.kind == "created" then
+                -- Non-returning: only our OWN created mover is handed back (a
+                -- game-owned one the game keeps driving; releaseMover would write a
+                -- stale vector). Returning: hand back whatever we grabbed, so the
+                -- game's own return re-drive owns the body again.
+                if rec.mover and (rec.mover.kind == "created" or returning) then
                     releaseMover(rec)
                 end
             end
@@ -10212,6 +10315,40 @@ Core.registerClass("JESTER", {
         -- is listed too: if it turns out to be the kicked ball, it is ridden
         -- for exactly the same reason.
         steerAfterOwnerStuds = { ability1 = 12, ability1new = 12 },
+
+        -- MINIMUM TURN RADIUS, per body, in studs. This is the "stop looking
+        -- like a heatseeker" knob and it is the one that matters for JESTER.
+        --
+        -- The tell was never the total deviation. Measured live: Q flights ran
+        -- dev=54-70 against a 78 budget with clamp utilisation of 3-5% -- the
+        -- per-frame clamp was almost never the binding limit -- while single
+        -- frames turned up to 12.7 degrees (roughly 2000 deg/s at the observed
+        -- frame rate). The ball took its whole correction in two or three
+        -- frames and then coasted, which on a body this large and this slow
+        -- reads as a visible snap toward the target rather than a thrown arc.
+        --
+        -- Radius, not degrees: omega = speed / radius, so capping the radius
+        -- caps the CURVATURE the eye reads and does it identically at any frame
+        -- rate. The correction is not reduced, it is spread -- the budget is
+        -- untouched, so hit rate is preserved on anything the ball has time to
+        -- reach, and only the corrections that were being taken instantly stop
+        -- being possible.
+        --
+        --   ability1 / ability1new  34  -- Q Bouncy Ball, speed 100. 34 studs is
+        --                                 ~168 deg/s, so the full 78 degree
+        --                                 budget takes ~0.47s of continuous
+        --                                 turning against a ~1.6s flight: it can
+        --                                 still spend all of it, just never at
+        --                                 once. Today's effective radius is
+        --                                 ~3.7 studs.
+        --   attack                  30  -- m1 Juggling Trick, speed 70. ~133
+        --                                 deg/s; the 55 degree budget takes
+        --                                 ~0.41s. Today's radius is ~2.6 studs.
+        --
+        -- Live-tunable only class-wide via `hstune minTurnRadiusStuds` (the
+        -- global default, 18); a per-body value needs an edit and a rebuild,
+        -- same as lockDev above.
+        minTurnRadius = { attack = 30, ability1 = 34, ability1new = 34 },
     },
 
     -- LOCK REACH, per body. Shortens what the lock will REACH FOR; the bolt
@@ -12384,7 +12521,6 @@ local COL_HP      = Color3.fromRGB(35, 255, 35)    -- 0603.lua:240
 local COL_SHIELD  = Color3.fromRGB(255, 200, 35)   -- 0603.lua:184
 local COL_DEAD    = Color3.fromRGB(91, 93, 105)    -- 0603.lua:238 / :182
 local COL_TEXT    = Color3.fromRGB(255, 255, 255)
-local COL_DIM     = Color3.fromRGB(170, 172, 180)  -- secondary text: distance
 local COL_BONE    = Color3.fromRGB(255, 255, 255)
 local COL_TRACK   = Color3.fromRGB(12, 12, 14)     -- bar background
 local COL_EDGE    = Color3.fromRGB(0, 0, 0)        -- outline
@@ -12428,8 +12564,18 @@ local S = {
                         -- honest answer to "is it drawing" before frame one.
     scanned = 0,
     drawn = 0,
+    lastErr = nil,      -- last per-player throw, surfaced by status/why. ESP's
+                        -- raw warn() is NOT captured by the Potassium log, so a
+                        -- silent throw here is otherwise undiagnosable.
     diag = {},          -- per-player skip reasons, refreshed every frame
     skeleton = true,
+    -- Drive the GAME's own overhead health display through walls instead of
+    -- drawing our own bars. It reads exactly like what every player already sees
+    -- (native name + health + blue shield ON the bar), so nothing looks bolted
+    -- on. Default ON — this is the whole point of the overlay now; our custom
+    -- bars are the fallback for when the native display cannot be found.
+    nativeBars = true,
+    nativeTouched = {},  -- [BillboardGui] = true, to restore AlwaysOnTop on off
     teamCheck = false,  -- hide allies. Off by default: teams.txt is empty and
                         -- FFA characters carry no Team child at all, so a team
                         -- filter hides nobody in the mode that is actually
@@ -12566,9 +12712,8 @@ local function makeTag(plr)
     gui.StudsOffset = Vector3.new(0, 3.0, 0)
     gui.Parent = S.folder
 
-    -- Name row: name left, distance right, in one row rather than stacked. The
-    -- distance is the thing that decides whether a target is worth turning for,
-    -- and it costs no vertical space here.
+    -- Name row. The distance readout that used to sit on the right was removed
+    -- 2026-08-02 at the user's request, so the name owns the full width.
     local row = Instance.new("Frame")
     row.BackgroundTransparency = 1
     row.Size = UDim2.new(1, 0, 0, 15)
@@ -12576,30 +12721,17 @@ local function makeTag(plr)
 
     local nameLbl = Instance.new("TextLabel")
     nameLbl.BackgroundTransparency = 1
-    nameLbl.Size = UDim2.new(1, -34, 1, 0)
+    nameLbl.Size = UDim2.new(1, 0, 1, 0)
     nameLbl.Font = Enum.Font.GothamBold
     nameLbl.TextSize = 13
     nameLbl.TextColor3 = COL_TEXT
     nameLbl.TextStrokeTransparency = 1
     nameLbl.TextXAlignment = Enum.TextXAlignment.Center
     nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
-    nameLbl.Position = UDim2.new(0, 17, 0, 0)
+    nameLbl.Position = UDim2.new(0, 0, 0, 0)
     nameLbl.Text = plr.Name
     nameLbl.Parent = row
     stroke(nameLbl, 1.6, 0.05)
-
-    local distLbl = Instance.new("TextLabel")
-    distLbl.BackgroundTransparency = 1
-    distLbl.Size = UDim2.new(0, 34, 1, 0)
-    distLbl.Position = UDim2.new(1, -34, 0, 0)
-    distLbl.Font = Enum.Font.Gotham
-    distLbl.TextSize = 11
-    distLbl.TextColor3 = COL_DIM
-    distLbl.TextStrokeTransparency = 1
-    distLbl.TextXAlignment = Enum.TextXAlignment.Right
-    distLbl.Text = ""
-    distLbl.Parent = row
-    stroke(distLbl, 1.4, 0.15)
 
     -- SAFE pill. Hidden by default, white on black, sat under the name row so
     -- it cannot push anything around when it appears.
@@ -12622,7 +12754,7 @@ local function makeTag(plr)
     local _, hpFill, hpText = bar(gui, 17, 12, COL_HP)
     local shRow, shFill, shText = bar(gui, 30, 12, COL_SHIELD)
 
-    local t = { gui = gui, name = nameLbl, dist = distLbl, safe = safe,
+    local t = { gui = gui, name = nameLbl, safe = safe,
                 hpFill = hpFill, hpText = hpText,
                 shRow = shRow, shFill = shFill, shText = shText }
     S.tags[plr] = t
@@ -12649,6 +12781,65 @@ local function statValue(char, name)
     return v and v.Value or nil
 end
 
+------------------------------------------------------------- native display --
+
+-- Drive the GAME's own overhead display (Head.PlayerDisplay, 0239.lua:163)
+-- through walls and keep it shown. THREE game systems hide it, and forcing both
+-- properties every frame beats all three:
+--   1. DisplayModifier (0239.lua:186) raycasts camera->head and sets
+--      PlayerDisplay.Enabled = false when the head is occluded or transparent.
+--   2. The Stealth handlers (0734/0735) disable every head BillboardGui when a
+--      player goes invisible.
+--   3. StealthWarning (0177) does the same on Head.Transparency >= 0.95.
+-- AlwaysOnTop renders it OVER geometry (through walls); Enabled un-hides it.
+-- Native health + blue shield colours come for free -- it is the same bar the
+-- player themselves sees, so it cannot look bolted on.
+-- Force EVERY overhead gui on the character on-top + enabled, not just
+-- Head.PlayerDisplay. The health bar is a static asset (no script builds it, so
+-- its exact hierarchy is unknowable from the dump) and setting AlwaysOnTop only
+-- on PlayerDisplay left the bar occluded when it turned out to be a sibling gui.
+-- A BillboardGui/SurfaceGui with AlwaysOnTop=true renders over all geometry, and
+-- Enabled=true beats the stealth/occlusion hiders. Every touched gui is tracked
+-- so restoreNativeDisplays can undo the AlwaysOnTop on ESP off.
+--
+-- Enabled=true ALONE IS NOT ENOUGH, and that was the whole bug: setGuiVisible
+-- (0239.lua:31-51) writes the gui's Enabled AND then walks GetDescendants() and
+-- sets `.Visible = false` on every GuiObject inside it. Re-enabling the gui
+-- therefore re-shows an entirely transparent hierarchy -- which is exactly what
+-- "native on (10 found), no error, still nothing on screen" looked like. Every
+-- GuiObject under a touched gui has to be forced Visible too.
+local function driveNativeDisplay(char)
+    local touched = false
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BillboardGui") or d:IsA("SurfaceGui") then
+            if d.AlwaysOnTop ~= true then
+                pcall(function() d.AlwaysOnTop = true end)
+            end
+            if d.Enabled ~= true then d.Enabled = true end
+            S.nativeTouched[d] = true
+            touched = true
+        elseif d:IsA("GuiObject") and not d.Visible then
+            -- Only inside a character-overhead gui; never touch anything else.
+            if d:FindFirstAncestorWhichIsA("LayerCollector") then
+                d.Visible = true
+            end
+        end
+    end
+    return touched
+end
+
+-- Hand the native displays back: AlwaysOnTop is ours to undo (the game never
+-- sets it), Enabled the game reasserts on its own next frame. Called on ESP off
+-- and teardown so turning the overlay off actually turns the wallhack off.
+local function restoreNativeDisplays()
+    for pd in pairs(S.nativeTouched) do
+        pcall(function()
+            if pd and pd.Parent then pd.AlwaysOnTop = false end
+        end)
+    end
+    S.nativeTouched = {}
+end
+
 ---------------------------------------------------------------------- update --
 
 local function update()
@@ -12664,6 +12855,7 @@ local function update()
 
     S.used = 0
     S.scanned, S.drawn = 0, 0
+    S.nativeFound = 0
     S.diag = {}
     S.ticks = S.ticks + 1
 
@@ -12709,55 +12901,72 @@ local function update()
             t.gui.Enabled = true
             S.drawn = S.drawn + 1
 
-            local cur = statValue(char, "CurrentHP")
-            local max = statValue(char, "MaxHP")
-            if cur and max then
-                max = max * (statValue(char, "MaxHPMult") or 1)
-            else
-                -- No Stats folder: a spawned entity rather than a player, and
-                -- those DO carry a real Humanoid (0003.lua:5830-5831).
-                cur = cur or (hum and hum.Health) or 0
-                max = max or (hum and hum.MaxHealth) or 0
-            end
-            if max <= 0 then max = 1 end
-            local frac = math.clamp(cur / max, 0, 1)
-            t.hpFill.Size = UDim2.new(frac, 0, 1, 0)
-            t.hpFill.BackgroundColor3 = cur > 0 and COL_HP or COL_DEAD
-            t.hpText.Text = fmtHp(cur, max)
-
-            -- The HUD hides the shield readout when the player has no shield
-            -- stat at all (0603.lua:164-175); mirror that instead of drawing a
-            -- dead bar on everyone.
-            -- Two different shield schemas exist and both are live. The HUD
-            -- reads CurrentShield/Shield (0603.lua:180-186), but a freshly
-            -- spawned character in spawn_state.txt carries `Stats.ShieldHP`
-            -- (also read directly at 0393.lua:17) with no CurrentShield at all.
-            -- Reading only the HUD pair means the shield row never appears for
-            -- anyone on the ShieldHP path.
-            local shMax = statValue(char, "Shield") or 0
-            local shieldHp = statValue(char, "ShieldHP")
-            if shMax <= 0 and shieldHp and shieldHp > 0 then shMax = shieldHp end
-            if shMax > 0 then
-                local shCur = statValue(char, "CurrentShield") or shieldHp or 0
-                t.shRow.Visible = true
-                t.shFill.Size = UDim2.new(math.clamp(shCur / shMax, 0, 1), 0, 1, 0)
-                t.shFill.BackgroundColor3 = shCur > 0 and COL_SHIELD or COL_DEAD
-                t.shText.Text = ("%d/%d"):format(shCur, shMax)
-                t.gui.Size = UDim2.new(0, 150, 0, 42)
-            else
-                t.shRow.Visible = false
-                t.gui.Size = UDim2.new(0, 150, 0, 29)
-            end
-
             -- Spawn protection is the single most useful thing to see at a
             -- glance: a Safe player cannot be damaged at all (CheckSafe,
             -- 0003.lua:4715) and is also the top reject reason in the engine's
-            -- own histogram. Colouring the name is cheaper to read than a
-            -- fourth row of text.
+            -- own histogram.
             local safe = (statValue(char, "Safe") or 0) > 0
             t.safe.Visible = safe
-            t.name.Text = plr.Name
-            t.dist.Text = ("%dm"):format((head.Position - origin).Magnitude)
+
+            -- Force the game's own bar through walls / visible while stealthed.
+            local nativeOk = S.nativeBars and driveNativeDisplay(char)
+
+            if nativeOk then
+                S.nativeFound = S.nativeFound + 1
+                -- The native PlayerDisplay now carries name + health + blue
+                -- shield through walls. Our overlay adds ONLY what it lacks --
+                -- the SAFE marker -- and everything else is hidden so the two
+                -- do not stack into a double readout.
+                t.name.Visible = false
+                t.hpFill.Parent.Visible = false   -- track that holds the hp fill
+                t.shRow.Visible = false
+                t.gui.Size = UDim2.new(0, 150, 0, 15)
+                t.gui.StudsOffset = Vector3.new(0, 4.2, 0)  -- sit above native bar
+            else
+                -- Native display not found (or nativeBars off): draw our own
+                -- bars, the original behaviour.
+                t.name.Visible = true
+                t.name.Text = plr.Name
+                t.hpFill.Parent.Visible = true
+                t.gui.StudsOffset = Vector3.new(0, 3.0, 0)
+
+                local cur = statValue(char, "CurrentHP")
+                local max = statValue(char, "MaxHP")
+                if cur and max then
+                    max = max * (statValue(char, "MaxHPMult") or 1)
+                else
+                    -- No Stats folder: a spawned entity rather than a player, and
+                    -- those DO carry a real Humanoid (0003.lua:5830-5831).
+                    cur = cur or (hum and hum.Health) or 0
+                    max = max or (hum and hum.MaxHealth) or 0
+                end
+                if max <= 0 then max = 1 end
+                local frac = math.clamp(cur / max, 0, 1)
+                t.hpFill.Size = UDim2.new(frac, 0, 1, 0)
+                t.hpFill.BackgroundColor3 = cur > 0 and COL_HP or COL_DEAD
+                t.hpText.Text = fmtHp(cur, max)
+
+                -- The HUD hides the shield readout when the player has no shield
+                -- stat at all (0603.lua:164-175); mirror that instead of drawing
+                -- a dead bar on everyone. Two shield schemas are both live: the
+                -- HUD reads CurrentShield/Shield (0603.lua:180-186), but a freshly
+                -- spawned character carries Stats.ShieldHP (0393.lua:17) with no
+                -- CurrentShield at all.
+                local shMax = statValue(char, "Shield") or 0
+                local shieldHp = statValue(char, "ShieldHP")
+                if shMax <= 0 and shieldHp and shieldHp > 0 then shMax = shieldHp end
+                if shMax > 0 then
+                    local shCur = statValue(char, "CurrentShield") or shieldHp or 0
+                    t.shRow.Visible = true
+                    t.shFill.Size = UDim2.new(math.clamp(shCur / shMax, 0, 1), 0, 1, 0)
+                    t.shFill.BackgroundColor3 = shCur > 0 and COL_SHIELD or COL_DEAD
+                    t.shText.Text = ("%d/%d"):format(shCur, shMax)
+                    t.gui.Size = UDim2.new(0, 150, 0, 42)
+                else
+                    t.shRow.Visible = false
+                    t.gui.Size = UDim2.new(0, 150, 0, 29)
+                end
+            end
 
             if S.skeleton then
                 drawSkeleton(char, COL_BONE)
@@ -12783,6 +12992,7 @@ function ESP.setOn(on)
 
     if not on then
         if S.conn then pcall(function() S.conn:Disconnect() end) ; S.conn = nil end
+        restoreNativeDisplays()   -- undo the through-walls we forced on game bars
         for plr in pairs(S.tags) do dropTag(plr) end
         S.tags = {}
         if S.folder then pcall(function() S.folder:Destroy() end) ; S.folder = nil end
@@ -12793,15 +13003,22 @@ function ESP.setOn(on)
         return false
     end
 
+    -- Revive. A module that can be turned ON but is permanently dead inside is
+    -- the shape CS_CONSTRAINTS §5b forbids: `destroy` sets alive = false, and
+    -- if this instance is still the published one, every turn-on afterwards
+    -- silently no-opped in update()'s first line.
+    S.alive = true
     ensureFolder()
     S.lines, S.used = {}, 0
     S.ticks, S.scanned, S.drawn, S.diag = 0, 0, 0, {}
     S.conn = RunService.RenderStepped:Connect(function()
         local ok, err = pcall(update)
         if not ok then
-            -- One throw must not leave a dead connection spamming every frame.
-            warn("[CsEsp] update error, disabling — " .. tostring(err))
-            ESP.setOn(false)
+            -- Record, do NOT disable. Blanking the whole overlay on one throw is
+            -- how a single transient nil made "none of the esp works" -- and
+            -- ESP's raw warn() is not captured by the Potassium log, so it was
+            -- also invisible. status/why now surface this instead.
+            S.lastErr = tostring(err)
         end
     end)
     return true
@@ -12817,6 +13034,16 @@ function ESP.setSkeleton(on)
     return S.skeleton
 end
 function ESP.skeletonOn() return S.skeleton end
+
+-- Native bars: drive the game's own overhead display through walls instead of
+-- our custom bars. Turning it OFF restores the game bars and falls back to our
+-- own rendering on the next frame.
+function ESP.setNativeBars(on)
+    S.nativeBars = on and true or false
+    if not S.nativeBars then restoreNativeDisplays() end
+    return S.nativeBars
+end
+function ESP.nativeBars() return S.nativeBars end
 
 function ESP.setMaxDist(n)
     n = tonumber(n)
@@ -12842,11 +13069,78 @@ function ESP.status()
             S.skeleton and "on" or "off", S.maxDist, S.teamCheck and "on" or "off")
     end
     if S.ticks == 0 then
-        return "esp ON · no frame rendered yet — run `esp status` again in a second"
+        -- Name WHY there is no frame. "run it again in a second" was the only
+        -- answer for a session and a half while the real reasons -- a dead
+        -- module, a destroyed folder, a throw on frame one -- were all sitting
+        -- right here unread. If it still says "run it again", it really is just
+        -- early.
+        local blocked =
+            (not S.alive) and "MODULE DEAD (destroy ran; re-inject)"
+            or (not (S.folder and S.folder.Parent)) and "FOLDER MISSING (host ui swept it)"
+            or (not S.conn) and "NOT CONNECTED"
+            or S.lastErr and ("THREW ON FRAME ONE: " .. S.lastErr)
+        return "esp ON · no frame rendered yet — "
+            .. (blocked or "run `esp status` again in a second")
     end
-    return ("esp ON · skeleton %s · dist %d · teamcheck %s · %d/%d drawn · %d bones · %d frames"):format(
+    return ("esp ON · native %s (%d found) · skeleton %s · dist %d · teamcheck %s · %d/%d drawn · %d bones · %d frames%s"):format(
+        S.nativeBars and "on" or "off", S.nativeFound or 0,
         S.skeleton and "on" or "off", S.maxDist, S.teamCheck and "on" or "off",
-        S.drawn, S.scanned, S.used, S.ticks)
+        S.drawn, S.scanned, S.used, S.ticks,
+        S.lastErr and (" · LAST ERROR: " .. S.lastErr) or "")
+end
+
+-- One-shot dump of a live overhead display, property by property.
+--
+-- The dump gives the SHAPE (trees/Workspace.txt:5013) --
+--   PlayerDisplay [BillboardGui]
+--     CharacterName [TextBox]
+--     HPBar [Frame] { Bar, ShieldBar, Temp, RD }
+--     CharacterStats [TextBox]
+-- -- but NOTHING in the client dump reads or writes HPBar or CharacterName.
+-- That driver is server-side and outside anything we can grep, so when
+-- CharacterStats renders through walls and its two siblings do not, the live
+-- properties are the only evidence there is. Visible is not the only way to
+-- hide a GuiObject: a Frame with BackgroundTransparency = 1 and a TextBox with
+-- TextTransparency = 1 are both invisible while Visible == true, and forcing
+-- transparency blind would repaint bars that are meant to be empty.
+function ESP.probe(who)
+    local target
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP and (not who
+            or plr.Name:lower():sub(1, #who) == who:lower()) then
+            target = plr ; break
+        end
+    end
+    if not target then return { "probe: no player matched " .. tostring(who) } end
+
+    local char = target.Character
+    local head = char and char:FindFirstChild("Head")
+    local pd = head and head:FindFirstChild("PlayerDisplay")
+    if not pd then
+        return { ("probe %s: no Head.PlayerDisplay (head %s)"):format(
+            target.Name, head and "present" or "MISSING") }
+    end
+
+    local function prop(inst, name)
+        local ok, v = pcall(function() return inst[name] end)
+        if not ok or v == nil then return nil end
+        return ("%s=%s"):format(name, tostring(v))
+    end
+
+    local out = { ("probe %s · PlayerDisplay Enabled=%s AlwaysOnTop=%s Adornee=%s"):format(
+        target.Name, tostring(pd.Enabled), tostring(pd.AlwaysOnTop),
+        tostring(pd.Adornee and pd.Adornee.Name or "nil")) }
+
+    for _, d in ipairs(pd:GetDescendants()) do
+        local bits = {}
+        for _, p in ipairs({ "Visible", "BackgroundTransparency", "TextTransparency",
+                             "ImageTransparency", "Size", "ZIndex", "Text" }) do
+            local s = prop(d, p)
+            if s then bits[#bits + 1] = s end
+        end
+        out[#out + 1] = ("  %s [%s] %s"):format(d.Name, d.ClassName, table.concat(bits, " "))
+    end
+    return out
 end
 
 -- Names every player the overlay skipped and why, in the same order and with
@@ -12854,9 +13148,10 @@ end
 function ESP.why()
     if not S.on then return { "esp is off" } end
     if S.ticks == 0 then return { "no frame rendered yet" } end
-    local out = { ("scanned %d, drawn %d, bones %d, folder %s"):format(
-        S.scanned, S.drawn, S.used,
+    local out = { ("scanned %d, drawn %d, native %d, bones %d, folder %s"):format(
+        S.scanned, S.drawn, S.nativeFound or 0, S.used,
         (S.folder and S.folder.Parent) and "live" or "MISSING") }
+    if S.lastErr then out[#out + 1] = "LAST ERROR: " .. S.lastErr end
     if #S.diag == 0 then
         out[#out + 1] = "nobody skipped"
     else
@@ -12865,11 +13160,16 @@ function ESP.why()
     return out
 end
 
+-- UNREGISTER FIRST. sweepOrphans used to run before the getgenv clear and was
+-- not protected, so one throw in there (CoreGui children are not all readable
+-- in every executor) left this dead module -- alive = false -- still published
+-- as __CS_ESP. Every later `esp on` then reused it, connected a RenderStepped
+-- that returned on line one, and reported "no frame rendered yet" forever.
 function ESP.destroy()
+    if getgenv().__CS_ESP == ESP then getgenv().__CS_ESP = nil end
     S.alive = false
     pcall(ESP.setOn, false)
-    sweepOrphans()
-    if getgenv().__CS_ESP == ESP then getgenv().__CS_ESP = nil end
+    pcall(sweepOrphans)
 end
 
 Players.PlayerRemoving:Connect(function(plr) dropTag(plr) end)
@@ -12883,7 +13183,7 @@ getgenv().__CS_ESP = ESP
 return ESP
 ]==]
 local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", "cs_esp.lua", }
-local ENGINE_BUILD = "2026-08-02 03:28:06"
+local ENGINE_BUILD = "2026-08-02 19:55:10"
 getgenv().__CS_BUILD = ENGINE_BUILD
 -- <<< ENGINE PAYLOAD END
 
@@ -13881,6 +14181,13 @@ end
 
 -- ============ cooldowns / speed ============
 
+-- Three counters, because "4 hooked" and "0 durations learned" together cannot
+-- say WHICH link is dead: a wrapper that never fires, a sweep that finds no
+-- cooldown table, or a clamp that finds nothing above the floor all look
+-- identical from the outside. cdHits counts wrapper entries, cdSweeps counts
+-- sweepCd runs, cdClamps counts values actually written down.
+S.cdHits, S.cdSweeps, S.cdClamps = 0, 0, 0
+
 local function rememberFull(key, full)
     if type(full) ~= "number" or full <= 0 then return end
     local k = tostring(key)
@@ -13905,7 +14212,10 @@ local function processTable(tbl, zero)
                     if full then
                         local fl = full * S.cdMult
                         if fl < S.minCd and full >= S.minCd then fl = S.minCd end
-                        if v > fl + 0.01 then tbl[k] = fl end
+                        if v > fl + 0.01 then
+                            tbl[k] = fl
+                            S.cdClamps = S.cdClamps + 1
+                        end
                     end
                 end
             end
@@ -13947,6 +14257,7 @@ end
 local function sweepCd()
     local cm = S.cm
     if not cm or S.cdMode == "off" then return end
+    S.cdSweeps = S.cdSweeps + 1
     local zero = S.cdMode == "zero"
     processData(dataOf(cm, false), zero)
     processData(dataOf(cm, true), zero)
@@ -14077,6 +14388,7 @@ local function hookCd(name, fn)
     if type(fn) ~= "function" or S.orig[name] then return end
     S.orig[name] = fn
     local function wrapped(self, moveName, duration, ...)
+        S.cdHits = S.cdHits + 1
         local ret = S.orig[name](self, moveName, duration, ...)
         if S.cdMode ~= "off" then
             if type(duration) == "number" then rememberFull(moveName, duration) end
@@ -14514,18 +14826,36 @@ end)
 -- Boots OFF and is not persisted. Unlike the combat toggles (CS_CONSTRAINTS.md
 -- §3) there is no reason to carry it across an inject, and a lobby full of
 -- name tags is exactly the kind of surface a person watching a stream notices.
-cmd("esp", "proven", "esp [on|off|skel|dist N|team|status|why] — names, health, shield, skeleton through walls", function(a)
+cmd("esp", "proven", "esp [on|off|native|skel|dist N|team|status|why|probe NAME] — game health/shield through walls (+ invisible), skeleton", function(a)
     -- Lazy-loaded from the embedded payload, same mechanism as the forge: the
     -- overlay is dead weight in a session that never turns it on.
+    -- The cached module is keyed to the PAYLOAD IT CAME FROM, not just to its
+    -- existence. A bare `if getgenv().__CS_ESP then return it` meant a module
+    -- loaded before a rebuild outlived the rebuild: `esp probe` called a method
+    -- the old module did not have, threw, and printed NOTHING AT ALL -- which
+    -- reads exactly like the command not existing. Same class of bug as v1/v2
+    -- divergence, one level down. Payload length is an exact enough key: the
+    -- payload is generated, so any engine edit changes it.
     local function espApi()
-        if getgenv().__CS_ESP then return getgenv().__CS_ESP end
         local body = ENGINE_PAYLOAD["cs_esp.lua"]
         if not body or #body == 0 then
             Log.warn("esp: payload missing cs_esp.lua — run tools/build_admin.sh")
             return nil
         end
+        local cached = getgenv().__CS_ESP
+        if cached and getgenv().__CS_ESP_SRC == #body then return cached end
+        if cached then
+            -- Retire it properly: it owns a RenderStepped connection and a
+            -- folder in the host UI that nothing else collects.
+            if type(cached.destroy) == "function" then pcall(cached.destroy) end
+            getgenv().__CS_ESP = nil
+        end
         local ok, err = pcall(function() loadstring(body)() end)
-        if not ok then Log.warn("esp: failed to load — " .. tostring(err)) end
+        if not ok then
+            Log.warn("esp: failed to load — " .. tostring(err))
+            return nil
+        end
+        getgenv().__CS_ESP_SRC = #body
         return getgenv().__CS_ESP
     end
 
@@ -14538,6 +14868,12 @@ cmd("esp", "proven", "esp [on|off|skel|dist N|team|status|why] — names, health
         for _, line in ipairs(api.why()) do Log.info("  " .. line) end
         return true, api.status()
     end
+    if sub == "probe" then
+        -- Live property dump of one player's native overhead display. Goes
+        -- through Log so it lands in cs_admin.log — ESP's own warn() does not.
+        for _, line in ipairs(api.probe(a[2])) do Log.info(line) end
+        return true, "probe done — see log"
+    end
     if sub == "skel" or sub == "skeleton" then
         return true, "skeleton " .. (api.setSkeleton(not api.skeletonOn()) and "on" or "off")
     end
@@ -14547,6 +14883,12 @@ cmd("esp", "proven", "esp [on|off|skel|dist N|team|status|why] — names, health
     end
     if sub == "team" or sub == "teamcheck" then
         return true, "teamcheck " .. (api.setTeamCheck(not api.teamCheck()) and "on — allies hidden" or "off")
+    end
+    if sub == "native" then
+        -- Toggle driving the GAME's own overhead bar through walls (native
+        -- health + blue shield) vs our custom drawn bars.
+        return true, "native bars " .. (api.setNativeBars(not api.nativeBars())
+            and "on — game health/shield through walls" or "off — custom bars")
     end
 
     local want
@@ -14592,6 +14934,22 @@ cmd("eng", "proven", "eng <CLASS|list|off> — toggle engine heatseek per class"
     local newState = not cfg.enabled
     core.setEnabled(sub, newState)
     return true, ("hs %s %s"):format(sub, newState and "on" or "off")
+end)
+
+-- Live switch for the universal flight law (hstune only takes numbers/booleans,
+-- and the law is a string). `hslaw` shows the current global law; `hslaw <mode>`
+-- sets it globally; `hslaw <mode> <CLASS>` overrides one class. Modes:
+-- hybrid (snap most of the way to the intercept, small residual), silent (snap
+-- fully, never correct), classicPN (the old mid-flight curve).
+cmd("hslaw", "proven", "hslaw [hybrid|silent|classicPN] [CLASS] — flight law", function(a)
+    local core = engine()
+    if not core then return false, "engine not loaded" end
+    if not a[1] then
+        return true, ("global flightLaw = %s (snapFraction=%s residualDev=%s)")
+            :format(tostring(core.T.flightLaw),
+                tostring(core.T.snapFraction), tostring(core.T.hybridResidualDevDeg))
+    end
+    return core.setFlightLaw(a[1], a[2])
 end)
 
 cmd("hstune", "proven", "hstune [key] [value] — engine tunables", function(a)
@@ -14751,6 +15109,82 @@ cmd("bodies", "proven", "bodies [CLASS] — real projectile names from the live 
     end
     out[#out + 1] = "BOLT = has Speed+Range+Damage. Compare against the allow list."
     return true, table.concat(out, "\n")
+end)
+
+-- One readout for "is anything actually wired". Every module below shares ONE
+-- precondition -- arm() ran -- and arm() returns early when `inMatch()` is false,
+-- which is `currentClassName() ~= nil`. With no class loaded nothing is hooked,
+-- so `cd half`, `speed`, `reach`, `amp` and `dmg` all accept their arguments,
+-- report success, and do nothing. That silence is the bug this command exists to
+-- break: the mode is stored (S.cdMode really is "half") while the hook that would
+-- act on it was never installed, so every readout that only echoes the mode says
+-- everything is fine.
+cmd("state", "proven", "state — is each module actually armed and hooked, or only configured", function()
+    local out = {}
+    local cls = currentClassName()
+    out[#out + 1] = ("class    : %s"):format(cls or
+        "NONE — nothing is armed; cd/speed/reach/amp/dmg all no-op until a class loads")
+    out[#out + 1] = ("armed    : %s   classmodule: %s"):format(
+        S.armed and "yes" or "NO", S.cm and "resolved" or "NOT FOUND")
+
+    local function hookState(list, label)
+        local found, hooked = {}, {}
+        for _, n in ipairs(list) do
+            if S.cm and type(S.cm[n]) == "function" then found[#found + 1] = n end
+            if S.orig and S.orig[n] then hooked[#hooked + 1] = n end
+        end
+        out[#out + 1] = ("%-9s: %d present, %d hooked%s"):format(
+            label, #found, #hooked,
+            (#hooked == 0 and #found > 0) and "  <-- present but NOT hooked" or "")
+    end
+    hookState(CD_FUNCS, "cooldown")
+    hookState(MOVE_GATES, "movegate")
+
+    local fullN = 0
+    for _ in pairs(S.fullCd or {}) do fullN = fullN + 1 end
+    out[#out + 1] = ("cd       : mode=%s  learned=%d  hookHits=%d sweeps=%d clamps=%d"):format(
+        S.cdMode, fullN, S.cdHits or 0, S.cdSweeps or 0, S.cdClamps or 0)
+    if S.cdMode ~= "off" then
+        -- Name the dead link instead of leaving three numbers to be read.
+        local diag =
+            ((S.cdHits or 0) == 0)
+                and "  <-- the hooked Cooldown fn NEVER FIRED: use an ability, and if it stays 0 the game is not calling what we hooked"
+            or ((S.cdSweeps or 0) == 0)
+                and "  <-- hook fires but sweepCd never ran: S.cm went nil after arm"
+            or (fullN == 0)
+                and "  <-- sweeping, but no cooldown table entry was a number: wrong table"
+            or ((S.cdClamps or 0) == 0)
+                and "  <-- learned durations but wrote nothing: every value already at or under half"
+            or nil
+        if diag then out[#out + 1] = diag end
+    end
+    out[#out + 1] = ("speed    : %s bonus=%s   reach: %s   amp: %s"):format(
+        S.speedOn and "on" or "off", tostring(S.speedBonus),
+        S.reachOn and "on" or "off",
+        S.ampOn and ("x" .. tostring(S.ampMult)) or "off")
+    out[#out + 1] = ("remotes  : damage=%s heal=%s effect=%s"):format(
+        S.damageRemote and "ok" or "MISSING",
+        S.healRemote and "ok" or "MISSING",
+        S.effectRemote and "ok" or "MISSING")
+
+    local core = engine()
+    if not core then
+        out[#out + 1] = "heatseek : ENGINE NOT LOADED"
+    else
+        local on, total = 0, 0
+        for _, cfg in pairs(core.classes()) do
+            total = total + 1
+            if cfg.enabled then on = on + 1 end
+        end
+        out[#out + 1] = ("heatseek : engine up, %d/%d classes enabled"):format(on, total)
+    end
+
+    local esp = getgenv().__CS_ESP
+    out[#out + 1] = ("esp      : %s"):format(
+        esp and (esp.isOn() and "on" or "off") or "not loaded")
+
+    for _, line in ipairs(out) do Log.info(line) end
+    return true, "state -> console + logs/cs_admin.log"
 end)
 
 cmd("caps", "proven", "caps — what the engine has proven it can do", function()
@@ -18057,14 +18491,14 @@ end)
 -- Pick the one that works and delete the other (CS_CONSTRAINTS.md 5b).
 -- v2 watches ITS OWN deploy name. Watching cs_admin.lua from here would swap
 -- the running v2 back to a v1 build on the next v1 rebuild.
-local HOT_SRC = "cs_adminv2.lua"
+local HOT_SRC = "cs_admin.lua"
 local HOT_POLL_SEC = 3
 
 -- REMOTE SOURCE. nil in every local build -- the workspace file is the deploy
 -- target here, and reading it is both instant and free.
 --
 -- tools/build_portable.sh rewrites this to a URL. That build runs on somebody
--- else's machine where `cs_adminv2.lua` is either absent or an unrelated file
+-- else's machine where `cs_admin.lua` is either absent or an unrelated file
 -- from another script pack, so the local watcher was compiled out entirely and
 -- the portable became a one-way door: every fix meant sending a new file and
 -- asking them to re-inject, mid-match.

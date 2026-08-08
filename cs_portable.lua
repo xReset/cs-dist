@@ -5207,6 +5207,12 @@ local function initFlightTelem(rec, cfg)
         bodyName    = nil,
         freezeWhy   = nil,
         devMax      = 0,
+        -- Set once the heading stops being ours -- on the freeze, or once
+        -- returnFade starts handing a boomerang back to the game. Past that
+        -- point devMax must not grow: what the body does next is the GAME
+        -- turning it, and recording it as deviation WE spent is what makes every
+        -- returning body grade C for its own return leg.
+        devSealed   = false,
         launchDir   = nil,
         -- Captured at spawn for the REACH learner. Read here rather than at
         -- flight end because the body is frequently already destroyed by then.
@@ -5288,6 +5294,9 @@ function Core.resetLegitStats()
     for k in pairs(Core.legitStats.tells) do Core.legitStats.tells[k] = 0 end
     Core.legitStats.frozenDev = 0
     Core.legitStats.frozenTerminal = 0
+    -- Was missed by the reset, so `hsreset` left the miss count carrying over
+    -- from before the change being measured.
+    Core.legitStats.frozenMiss = 0
     Core.legitStats.unsteered = 0
     Core.legitStats.unsteeredWhy = {}
     Core.legitStats.onCourse = 0
@@ -5437,8 +5446,14 @@ local function telemFlightEnd(rec, proj, outcome)
     -- The old version compared against aimDirInit, which is where we WANTED the
     -- bolt to go, so a shot that was corrected hard immediately scored as barely
     -- deviating at all. It was measuring the wrong angle.
+    -- Skipped once the heading is no longer ours (see tl.devSealed). This final
+    -- sample reads the body's CURRENT velocity, so on a boomerang it lands
+    -- somewhere on the return leg and reported dev=99-172 against a 55 budget
+    -- while our own totalTurn was 3-62 -- the game's 180 for home, scored as
+    -- ours. Every `attack` flight graded C for it.
     local aimDev = tl.devMax or 0
-    if tl.launchDir and proj and proj.Parent then
+    if tl.launchDir and not tl.devSealed and not tl.freezeWhy
+        and proj and proj.Parent then
         local alv = proj.AssemblyLinearVelocity
         if alv and alv.Magnitude > 1 then
             local d = math.clamp(tl.launchDir:Dot(alv.Unit), -1, 1)
@@ -5599,8 +5614,26 @@ end
 -- Which flight law governs this class. Per-class `cfg.flight.flightLaw` wins;
 -- otherwise the global T.flightLaw. Unknown/absent falls back to the safe old
 -- law so a typo can never silently disable guidance for a class.
-function Core.flightLawFor(cfg)
+function Core.flightLawFor(cfg, proj)
     local f = cfg and cfg.flight
+    -- PER BODY override, and it wins over the boomerang rule below.
+    --
+    -- The boomerang rule is a CLASS-wide flag, but a class can hold both shapes:
+    -- JESTER's `attack` is a returning Juggling Trick and its `ability1` is a
+    -- kicked Bouncy Ball that explodes on a 1.5s fuse (0567.lua:1345) and never
+    -- comes home. One flag put both on the old mid-flight law, so the ball --
+    -- the biggest, slowest, most visible body in the kit -- was the one thing
+    -- that could not have the snap.
+    --
+    --     flight = { flightLaw = { ability1 = "hybrid" } }
+    --
+    -- A string here is still class-wide, exactly as before.
+    local ov = f and f.flightLaw
+    if type(ov) == "table" then
+        ov = proj and ov[proj.Name] or nil
+        if ov == "hybrid" or ov == "silent" or ov == "classicPN" then return ov end
+        ov = nil
+    end
     -- Boomerang bodies are RECLAIMED by the game and flown home. The spawn snap
     -- redirects a body's launch velocity onto the intercept and holds a mover on
     -- it -- which fights the return: the ball sails off on our heading and
@@ -5609,7 +5642,7 @@ function Core.flightLawFor(cfg)
     -- all under the snap. These stay on the old mid-flight law, which frees the
     -- body on reversal (see the reversal guard) and lets the game's return run.
     if f and f.stopWhenReturningToOwner then return "classicPN" end
-    local law = (f and f.flightLaw) or T.flightLaw or "classicPN"
+    local law = (type(ov) == "string" and ov) or T.flightLaw or "classicPN"
     if law ~= "hybrid" and law ~= "silent" then return "classicPN" end
     return law
 end
@@ -5829,58 +5862,145 @@ local function steer(proj, cfg, ctx)
     -- ── UNIVERSAL FLIGHT LAW ────────────────────────────────────────────
     -- Silent-aim spawn snap. See T.flightLaw. classicPN skips all of this and
     -- behaves exactly as it did before this block existed.
-    local flightLaw = Core.flightLawFor(cfg)
+    local flightLaw = Core.flightLawFor(cfg, proj)
     -- Effective IN-FLIGHT deviation cap. classicPN keeps the class's full budget;
     -- hybrid clamps it to the small residual (the snap already did the aiming);
     -- silent forbids any correction at all. This is the ONLY deviation number the
     -- freeze reads below -- the lock-time cone still uses lockDevFor unchanged.
     local devCap = Core.lockDevFor(cfg, proj)
+    -- The residual is applied ON SNAP, not up front. A body whose snap is
+    -- DEFERRED to the kick (see rideGate) must keep its full budget until the
+    -- snap actually lands -- otherwise a kick we fail to detect leaves the body
+    -- with an 8 degree budget and no snap to justify it, i.e. no guidance at all.
+    local devCapAfterSnap = devCap
     if flightLaw == "hybrid" then
-        devCap = math.min(devCap, T.hybridResidualDevDeg or 8)
+        devCapAfterSnap = math.min(devCap, T.hybridResidualDevDeg or 8)
     elseif flightLaw == "silent" then
-        devCap = 0
+        devCapAfterSnap = 0
     end
     if rec.tl then rec.tl.devBudget = devCap end
-    if flightLaw ~= "classicPN" and Core.legitNow() then
+
+    -- THE SNAP, as a closure so it can fire later than spawn.
+    --
+    -- A ridden body has no launch at spawn: JESTER's Bouncy Ball is summoned
+    -- UNDER the player, bounced on up to three times, and only then kicked
+    -- (0567.lua:1345 -- "On recast, aim and kick the ball"). Snapping at spawn
+    -- would aim a ball the player is standing on, which moves the player. So for
+    -- those bodies the snap waits for the kick and aims it THEN.
+    local rideGate = Core.steerAfterOwnerStudsFor(cfg, proj)
+    local snapDone = false
+    -- Previous frame's travel direction, used only by the kick detector below.
+    local kickPrevDir = nil
+    -- Set when the kick re-lock finds nothing in the cone: the loop ends the
+    -- flight rather than steering on a lock taken before the player turned.
+    local kickAbort = false
+    local function trySnap()
+        if snapDone or flightLaw == "classicPN" or not Core.legitNow() then return end
+        -- Never write a mover onto a body that is welded to a character: that
+        -- drives the character, not the bolt. Matters more here than at spawn --
+        -- a ride-gated snap fires while the body is still near its owner.
+        local mcNow = char()
+        if mcNow and weldedToCharacter(proj, mcNow) then return end
+        -- RE-LOCK AT THE KICK. This is a correctness fix, not a polish one.
+        --
+        -- A ride-gated body is TARGETED when it spawns and AIMED when it is
+        -- kicked, and those are different moments -- JESTER's ball is bounced on
+        -- up to three times in between (0567.lua:1345), which is seconds. Turn
+        -- around while bouncing and the lock taken at the summon is now BEHIND
+        -- you, and the snap hard-turns the ball onto it: reported live as "a Q
+        -- went literally behind me".
+        --
+        -- Under the old law this was survivable -- PN curved gradually and the
+        -- deviation budget froze it after 78 degrees. The snap removed that
+        -- ceiling by design, so a stale lock now costs the whole kick.
+        --
+        -- Re-picked from the BALL'S OWN travel direction, which IS the kick: the
+        -- cone is then measured from where the player actually kicked, so a
+        -- target outside it is refused rather than swung onto. If nothing is in
+        -- the cone at that moment, the kick is simply not guided.
+        if rideGate then
+            local alvR = proj.AssemblyLinearVelocity
+            local kickLook = (alvR and alvR.Magnitude > 1) and alvR.Unit or initLook
+            local nt = Core.pickTarget(reachFor(cfg, proj, projRange(proj)), mcNow, {
+                originPos  = proj.Position,
+                originLook = kickLook,
+                exclude    = ctx and ctx.exclude,
+                allyPlayer = ctx and ctx.allyPlayer,
+                allyName   = ctx and ctx.allyName,
+            }, lockFovFor(cfg, proj), nil, nil, projSpeed(proj), Core.lockDevFor(cfg, proj))
+            if not nt then
+                -- Nothing kickable in the direction of the kick. Mark the snap
+                -- done so this does not re-run pickTarget every frame, and let
+                -- the loop end the flight -- an unguided ball is the honest
+                -- outcome and it still explodes on its own fuse.
+                snapDone = true
+                kickAbort = true
+                return
+            end
+            if nt ~= tgt then
+                logx("flight", ("#%s kick re-lock %s -> %s")
+                    :format(tostring(rec.tl and rec.tl.castId or "?"),
+                        tostring(tgt and tgt.Name or "?"), nt.Name))
+            end
+            tgt = nt
+            rec.target = nt
+        end
+        local th0 = tgt and tgt:FindFirstChild("HumanoidRootPart")
+        if not (th0 and th0.Parent) then return end
+        local sp0 = projSpeed(proj)
+        local aim0 = leadPoint(th0, proj.Position, sp0)
+        local want = aim0 - proj.Position
+        -- Heading the body is actually travelling right now (physics first, then
+        -- the spawn look) -- the direction the snap turns AWAY from.
+        local cur0 = initLook
+        local alv0 = proj.AssemblyLinearVelocity
+        if alv0 and alv0.Magnitude > 1 then cur0 = alv0.Unit end
+        if not (want.Magnitude > 1e-3 and cur0 and cur0.Magnitude > 1e-6) then return end
+        local frac = (flightLaw == "silent") and 1 or (T.snapFraction or 0.9)
+        -- LATENESS TAPER. A snap at the launch is invisible -- nobody has seen the
+        -- body move yet, so there is no "before" to compare against. The same snap
+        -- applied after the body is already in open flight is a kink, and the
+        -- later it lands the more it reads as one. So the fraction decays with how
+        -- far the body has already travelled, and a late snap becomes a lean
+        -- rather than a turn. `spawnPos` is reset every ridden frame, so for a
+        -- kicked body this measures from the KICK, which is what matters.
+        local travelled = (proj.Position - spawnPos).Magnitude
+        if travelled > 4 and flightLaw ~= "silent" then
+            frac = frac * math.clamp(1 - (travelled - 4) / 12, 0.3, 1)
+        end
+        local snapped = cur0.Unit:Lerp(want.Unit, frac)
+        if snapped.Magnitude <= 1e-6 then return end
+        snapped = snapped.Unit
+        -- Write the heading into the mover immediately: the body leaves on the
+        -- intercept. VELOCITY ONLY -- the game owns the part's orientation
+        -- (0704.lua:716 pins it), so there is no crab to correct.
+        ensureMover(proj, sp0, snapped, rec)
+        -- Seed launchDir to the SNAPPED heading so the deviation budget and the
+        -- reversal guard measure the residual from here. Left nil, the loop would
+        -- set launchDir to the pre-snap aim and read the snap itself as one
+        -- enormous deviation -> instant freeze.
+        launchDir = snapped
+        snapDone = true
+        devCap = devCapAfterSnap
         -- The snap IS the launch, so there is no fly-straight muzzle delay to sit
         -- through: that delay hides the ONSET of a curve, and there is no curve.
         budget.muzzle = 0
-        local th0 = tgt:FindFirstChild("HumanoidRootPart")
-        if th0 and th0.Parent then
-            local sp0 = projSpeed(proj)
-            local aim0 = leadPoint(th0, proj.Position, sp0)
-            local want = aim0 - proj.Position
-            -- Heading the bolt is actually travelling right now (physics first,
-            -- then the spawn look) -- the direction the snap turns AWAY from.
-            local cur0 = initLook
-            local alv0 = proj.AssemblyLinearVelocity
-            if alv0 and alv0.Magnitude > 1 then cur0 = alv0.Unit end
-            if want.Magnitude > 1e-3 and cur0 and cur0.Magnitude > 1e-6 then
-                local frac = (flightLaw == "silent") and 1 or (T.snapFraction or 0.9)
-                local snapped = cur0.Unit:Lerp(want.Unit, frac)
-                if snapped.Magnitude > 1e-6 then
-                    snapped = snapped.Unit
-                    -- Write the heading into the mover immediately: frame 0 leaves
-                    -- on the intercept. VELOCITY ONLY -- the game owns the part's
-                    -- orientation (0704.lua:716 pins it), so there is no crab to
-                    -- correct and no CFrame to fight.
-                    ensureMover(proj, sp0, snapped, rec)
-                    -- Seed launchDir to the SNAPPED heading so the deviation budget
-                    -- and the reversal guard measure the residual from here. Left
-                    -- nil, the loop would set launchDir to the pre-snap aim and read
-                    -- the snap itself as one enormous deviation -> instant freeze.
-                    launchDir = snapped
-                    if rec.tl then
-                        rec.tl.launchDir = snapped
-                        rec.tl.snapped = true
-                    end
-                    logx("flight", ("#%s snap %s law=%s frac=%.2f")
-                        :format(tostring(rec.tl and rec.tl.castId or "?"),
-                            proj.Name, flightLaw, frac))
-                end
-            end
+        flightStart = os.clock()
+        if rec.tl then
+            rec.tl.launchDir = snapped
+            rec.tl.devBudget = devCap
+            rec.tl.snapped = true
         end
+        -- `d` is the studs already flown when the snap landed, and it is the
+        -- number that says whether the kick detector is working: at the kick it
+        -- reads ~0, and anything near the ride gate means the fallback fired and
+        -- the snap was late. Do not diagnose this from firstSteer again.
+        logx("flight", ("#%s snap %s law=%s frac=%.2f d=%.1f%s")
+            :format(tostring(rec.tl and rec.tl.castId or "?"),
+                proj.Name, flightLaw, frac, travelled,
+                rideGate and " (kick-gated)" or ""))
     end
+    if not rideGate then trySnap() end
     -- ────────────────────────────────────────────────────────────────────
 
     local outcome = "flight end"
@@ -6065,6 +6185,54 @@ local function steer(proj, cfg, ctx)
             end
         end
 
+        -- THE KICK — where a ride-gated body gets its snap.
+        --
+        -- Detected on the BALL'S OWN MOTION, not on the ride gate. The gate is 12
+        -- studs, which at speed 100 is ~0.12s of visible flight already spent, and
+        -- a heading change that late is the exact tell this removes. A kicked ball
+        -- is moving at most of its declared Speed and moving AWAY from the owner;
+        -- a ridden one is being bounced on and does neither. The ride gate stays
+        -- as the fallback so a kick we never recognise still gets aimed rather
+        -- than flying with a residual budget and no snap.
+        if rideGate and not snapDone then
+            local sp0 = projSpeed(proj)
+            local alvK = proj.AssemblyLinearVelocity
+            local vMag = alvK and alvK.Magnitude or 0
+            -- DIRECTION STABILITY, not direction-away-from-owner.
+            --
+            -- The first version required the velocity to point away from the
+            -- owner's root. The ball is summoned UNDERNEATH the player, so that
+            -- offset points DOWN while the kick sends it HORIZONTALLY -- the dot
+            -- product sits near zero and the test could not pass until the ball
+            -- had travelled far enough sideways for the offset to turn
+            -- horizontal, i.e. right about the 12-stud ride gate. MEASURED: every
+            -- Q flight snapped at firstSteer=108-122ms, and 12 studs at speed 100
+            -- is 120ms. The detector never fired once; the fallback did every
+            -- time, which put a 90% heading change 0.12s into visible flight.
+            -- That is a mid-air kink, and it is worse than the curve it replaced.
+            --
+            -- What actually separates the two phases is STEADINESS. A kicked ball
+            -- holds one direction; a ball being bounced on is reversing every
+            -- bounce. Two consecutive frames of near-identical heading at most of
+            -- the declared Speed is the kick, and it is true on the first frame
+            -- after it, while the ball is still at the player's feet.
+            if vMag >= sp0 * 0.55 and sp0 > 0 then
+                local dir = alvK.Unit
+                if kickPrevDir and kickPrevDir:Dot(dir) > 0.97 then
+                    trySnap()
+                end
+                kickPrevDir = dir
+            else
+                kickPrevDir = nil
+            end
+            -- Fallback: it has left the owner and we still never recognised a
+            -- kick. Snapping late is worse than snapping at the kick, so this is
+            -- softened inside trySnap (see the lateness taper) rather than
+            -- applying the full fraction to a body already in open flight.
+            if not snapDone and not ridden then trySnap() end
+            if kickAbort then outcome = "no target at kick" ; break end
+        end
+
         local sinceSpawn = now - flightStart
         if ridden then
             spawnPos = proj.Position
@@ -6232,7 +6400,15 @@ local function steer(proj, cfg, ctx)
                         -- it was showing the return leg of bodies we had already
                         -- let go of. Recording it as deviation WE spent made
                         -- every returning body look like a runaway.
-                        if rec.tl and not steerFrozen
+                        -- returnFade is the other end of the same handover. It
+                        -- scales our clamp to zero as a boomerang comes home, so
+                        -- below 1 the heading is already mostly the game's --
+                        -- and that is BEFORE the freeze, so gating on
+                        -- steerFrozen alone still let the return leg in.
+                        if rec.tl and (steerFrozen or returnFade < 1) then
+                            rec.tl.devSealed = true
+                        end
+                        if rec.tl and not rec.tl.devSealed
                             and dev > (rec.tl.devMax or 0) then
                             rec.tl.devMax = dev
                         end
@@ -8086,6 +8262,19 @@ function Core.setFlightLaw(mode, className)
         local key = tostring(className):upper()
         local cfg = S.classes[key]
         if not cfg then return false, "unknown class " .. key end
+        -- A per-BODY table must not be flattened to a string. JESTER carries
+        -- `flightLaw = { ability1 = "hybrid" }` precisely so its boomerang m1
+        -- stays on classicPN; writing a bare string here would put the returning
+        -- body on the snap and reintroduce the 10/16 "gone" regression from one
+        -- live command. Retarget the existing entries instead.
+        if type(cfg.flight.flightLaw) == "table" then
+            local names = {}
+            for bodyName in pairs(cfg.flight.flightLaw) do names[#names + 1] = bodyName end
+            table.sort(names)
+            for _, bodyName in ipairs(names) do cfg.flight.flightLaw[bodyName] = mode end
+            return true, ("%s flightLaw -> %s (bodies: %s)")
+                :format(key, mode, table.concat(names, ", "))
+        end
         cfg.flight.flightLaw = mode
         return true, ("%s flightLaw -> %s"):format(key, mode)
     end
@@ -10316,6 +10505,27 @@ Core.registerClass("JESTER", {
         -- for exactly the same reason.
         steerAfterOwnerStuds = { ability1 = 12, ability1new = 12 },
 
+        -- FLIGHT LAW, PER BODY. The Q ball gets the snap; the m1 does not.
+        --
+        -- `stopWhenReturningToOwner` above is class-wide and forces classicPN for
+        -- the whole class (Core.flightLawFor), because the snap holds a mover on a
+        -- body the game wants to fly home -- MEASURED on `attack` 2026-08-02,
+        -- 10/16 went "gone" instead of returning. That rule is right for `attack`
+        -- (Juggling Trick, a real boomerang) and wrong for `ability1`: the Bouncy
+        -- Ball is KICKED and explodes on a 1.5s fuse (0567.lua:1345). It never
+        -- comes home, so nothing of the game's is being fought.
+        --
+        -- Why the ball specifically: it is the biggest and slowest body in the kit
+        -- and it was carrying a 78 degree deviation budget, so its correction was
+        -- a visible hook on a giant slow object. Under the snap the aiming happens
+        -- at the KICK -- before an onlooker has any reference for where it was
+        -- meant to go -- and the flight itself is straight. The 78 stays for the
+        -- lock cone; only the IN-FLIGHT residual drops (T.hybridResidualDevDeg, 8).
+        --
+        -- The snap is deferred to the kick by the ride gate above; see the kick
+        -- detector in cs_core steer(). Revert with `hslaw classicPN JESTER`.
+        flightLaw = { ability1 = "hybrid", ability1new = "hybrid" },
+
         -- MINIMUM TURN RADIUS, per body, in studs. This is the "stop looking
         -- like a heatseeker" knob and it is the one that matters for JESTER.
         --
@@ -11005,6 +11215,70 @@ Core.registerClass("GLADIATOR", {
         "ability3",  -- R slot — kit has no AB3; belt-and-braces
         "critical",  -- F Challenger's Approach — dash + arena (0567.lua:1112)
         "arena", "challenge", "guard", "leap", "trident",
+        "eff", "visual", "sheathe",
+    },
+})
+
+--------------------------------------------------------------------------
+-- DANCER — E ONLY, as instructed.
+--
+-- NOT WINDDANCER. Two different classes, both present in the game
+-- (trees/Players.txt:2122 lists `DANCER` and `WINDDANCER` as separate
+-- ObjectValues, with separate Anims folders at :4791 and :4863). WINDDANCER's
+-- kit table is 0567.lua:2834 and spells CLASS with a space, "WIND DANCER";
+-- DANCER's is 0567.lua:501 and spells it "DANCER". The alias matcher is
+-- prefix-tolerant at >=5 chars, so "DANCER" could otherwise have collided with
+-- the WINDDANCER config -- both configs list only their exact spellings.
+--
+-- Kit (0567.lua:501), CAT = ASSASSIN:
+--   ATK Chakram Spin / Chakram Slice -- spin in place (5 dmg), and every 4th
+--                              attack becomes a forward LEAP with a vertical
+--                              slash (8 dmg). Melee, moves the caster.   DENIED
+--   AB1 Graceful Leap       -- Q. A leap. No outgoing body at all.        DENIED
+--   AB2 Infinity Loop       -- E. "Throw a projectile, dealing 5 neutral
+--                              damage going forwards AND BACKWARDS. On a
+--                              successful hit, resets ability cooldowns."
+--                              THE ONLY THROWN PROJECTILE IN THE KIT.    ALLOWED
+--   CRT Aether Dash / Combo Breaker -- F. Dashes THROUGH enemies. Steering a
+--                              body that carries the caster is the Magic Baton
+--                              problem (see TRICKSTER) -- it would decide where
+--                              the player ends up.                        DENIED
+--
+-- Slot map (0003.lua:37): Ability2 = "e". Same mapping GLADIATOR, FIGHTER,
+-- FROST, JAVELIN, BLASTER and PHANTOM are keyed on, so the E body follows the
+-- `ability2` convention.
+--
+-- Infinity Loop goes "forwards and backwards" -- it is a BOOMERANG, so
+-- `stopWhenReturningToOwner` is set. That flag also routes the body to
+-- `classicPN` rather than the hybrid snap, which is correct and deliberate:
+-- HANDOFF_2026-08-05 §1 records the 10/16 `gone` regression from putting a
+-- returning body on the snap (JESTER `attack`). Do not add a `flightLaw` here.
+--
+-- UNVERIFIED — DANCER is ABSENT from both the dump
+-- (classes_projectiles.txt:4) and the projectile census
+-- (class_census_master.txt:6, "STILL MISSING"), so `ability2` is the
+-- convention, not a measurement. Convention guesses have been wrong seven
+-- times. CONFIRM before trusting: arm DANCER, throw one Infinity Loop, and read
+-- the `DANCER bodies:` arm-time audit line (or `claim X [DANCER]`) in
+-- cs_core.log. If the loop is named for itself (e.g. `loop`, `infinityloop`,
+-- `ability2loop`) rather than `ability2`, add that exact name here -- until
+-- then the allow list simply claims nothing, which is a safe failure the reject
+-- histogram reports as `not DANCER bolt (X)`, printing the real name.
+--
+-- Ally support needs nothing extra: registering the class gives both self
+-- heatseek and the ally echo, and allyAllow/allyDeny fall through to allow/deny.
+--------------------------------------------------------------------------
+Core.registerClass("DANCER", {
+    aliases = { "DANCER" },      -- 0567.lua:501-502 (CLASS field)
+    accept  = Core.gates.classProvenance,
+    allow   = { "ability2" },    -- E Infinity Loop (0567.lua:520) — UNVERIFIED (class unstreamed)
+    flight  = { stopWhenReturningToOwner = true },  -- "forwards and backwards" (0567.lua:522)
+    deny    = {
+        "attack",    -- ATK Chakram Spin / Slice — melee, and the Slice leaps (0567.lua:506)
+        "ability1",  -- Q Graceful Leap — a leap, no bolt (0567.lua:515)
+        "ability3",  -- R slot — kit has no AB3; belt-and-braces
+        "critical",  -- F Aether Dash / Combo Breaker — dash, carries the caster (0567.lua:526)
+        "chakram", "slice", "spin", "dash", "combo", "leap",
         "eff", "visual", "sheathe",
     },
 })
@@ -13183,7 +13457,7 @@ getgenv().__CS_ESP = ESP
 return ESP
 ]==]
 local ENGINE_ORDER = { "cs_core.lua", "cs_classes.lua", "cs_projectile_forge.lua", "cs_esp.lua", }
-local ENGINE_BUILD = "2026-08-02 19:55:10"
+local ENGINE_BUILD = "2026-08-08 00:02:20"
 getgenv().__CS_BUILD = ENGINE_BUILD
 -- <<< ENGINE PAYLOAD END
 
